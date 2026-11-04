@@ -21,7 +21,15 @@
 
 #include <esp_lcd_touch_cst9217.h>
 #include <esp_lvgl_port.h>
+#include <esp_random.h>
+#include <esp_timer.h>
 #include <lvgl.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstring>
+
+#include "jako_face.h"
 
 #define TAG "WaveshareEsp32s3TouchAMOLED1inch75"
 
@@ -78,6 +86,10 @@ static const co5300_lcd_init_cmd_t vendor_specific_init[] = {
 };
 
 // 在waveshare_amoled_1_75类之前添加新的显示类
+// The device shows Jako's face full screen instead of the emoji, the status
+// bar and the subtitle (the stage shows the words). The status objects stay
+// alive and keep updating, hidden. If the face cannot be created the stock
+// UI is left as it was and every override falls back to the base class.
 class CustomLcdDisplay : public SpiLcdDisplay {
 public:
     static void rounder_event_cb(lv_event_t* e) {
@@ -112,13 +124,197 @@ public:
     }
 
     virtual void SetupUI() override {
+        if (IsSetupUICalled()) {
+            return;
+        }
         // Call parent SetupUI() first to create all lvgl objects
         SpiLcdDisplay::SetupUI();
 
+        {
+            DisplayLockGuard lock(this);
+            lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES*  0.1, 0);
+            lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES*  0.1, 0);
+            lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+
+            face_ = jako_face_create(lv_screen_active());
+            if (face_ == nullptr) {
+                ESP_LOGE(TAG, "No memory for the face, keeping the stock UI");
+                return;
+            }
+            // Just above container_, under everything else: the low battery
+            // popup and a preview image still draw on top of the face.
+            lv_obj_move_to_index(face_, 1);
+            jako_face_set_seed(face_, esp_random());
+            jako_face_set_pre_tick(face_, PreTick, this);
+            for (lv_obj_t* obj : {emoji_box_, top_bar_, status_bar_}) {
+                if (obj != nullptr) {
+                    lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
+            Apply();
+        }
+        LcdDisplay::SetHideSubtitle(true);
+    }
+
+    virtual bool SetEmotion(const char* emotion) override {
         DisplayLockGuard lock(this);
-        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES*  0.1, 0);
-        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES*  0.1, 0);
-        lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+        if (face_ == nullptr) {
+            return LcdDisplay::SetEmotion(emotion);
+        }
+        // An alert's icon names raise the error state until the next state.
+        // Only neutral clears it (DismissAlert and the idle handler send it);
+        // a reply's emotion queued behind an alert must not wipe the error.
+        if (IsErrorEmotion(emotion)) {
+            layer_ = FaceLayer::kError;
+        } else if (layer_ == FaceLayer::kError && emotion != nullptr && strcmp(emotion, "neutral") == 0) {
+            layer_ = FaceLayer::kNone;
+        }
+        jako_face_set_expression(face_, emotion);
+        Apply();
+        return true;
+    }
+
+    virtual void SetDeviceState(DeviceState state) override {
+        DisplayLockGuard lock(this);
+        device_state_ = state;
+        if (face_ == nullptr) {
+            return;
+        }
+        if (layer_ == FaceLayer::kThinking) {
+            layer_ = FaceLayer::kNone;
+        }
+        // Idle must not clear an error: the network error path sets idle
+        // before Alert(), and that idle event is handled after the alert.
+        if (layer_ == FaceLayer::kError && state != kDeviceStateIdle &&
+            state != kDeviceStateUnknown) {
+            layer_ = FaceLayer::kNone;
+        }
+        if (state == kDeviceStateFatalError) {
+            layer_ = FaceLayer::kError;
+        }
+        Apply();
+    }
+
+    virtual void SetChatMessage(const char* role, const char* content) override {
+        LcdDisplay::SetChatMessage(role, content);
+        DisplayLockGuard lock(this);
+        if (face_ == nullptr) {
+            return;
+        }
+        // Thinking runs from the user's words (stt) until tts start. Only
+        // from listening: stt while speaking (realtime mode) is ignored.
+        if (role != nullptr && strcmp(role, "user") == 0 && content != nullptr &&
+            content[0] != '\0' && device_state_ == kDeviceStateListening &&
+            layer_ == FaceLayer::kNone) {
+            layer_ = FaceLayer::kThinking;
+            thinking_since_ms_ = (uint32_t)(esp_timer_get_time() / 1000);
+            Apply();
+        }
+    }
+
+    virtual void SetPowerSaveMode(bool on) override {
+        DisplayLockGuard lock(this);
+        if (face_ == nullptr) {
+            LcdDisplay::SetPowerSaveMode(on);
+            return;
+        }
+        // Rest only. The base would call SetEmotion("sleepy"), which would
+        // clear a latched error.
+        jako_face_set_rest(face_, on);
+    }
+
+    virtual void SetHideSubtitle(bool hide) override {
+        DisplayLockGuard lock(this);
+        // The device never shows the subtitle while the face is up.
+        LcdDisplay::SetHideSubtitle(face_ != nullptr ? true : hide);
+    }
+
+    virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override {
+        // Under one lock, so the LVGL task never draws the stock icon that
+        // the base shows again when the preview ends. The mutex is recursive.
+        DisplayLockGuard lock(this);
+        LcdDisplay::SetPreviewImage(std::move(image));
+        if (face_ != nullptr && emoji_box_ != nullptr) {
+            lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    // Called from the audio output task once per frame: no lock, no log.
+    virtual void SetAudioLevel(float level) override {
+        level_.store(level, std::memory_order_relaxed);
+        level_ms_.store((uint32_t)(esp_timer_get_time() / 1000), std::memory_order_release);
+    }
+
+private:
+    // What sits on top of the device state. Named states, not flags.
+    enum class FaceLayer { kNone, kThinking, kError };
+
+    // A level older than this means playback has paused: the mouth closes.
+    static constexpr uint32_t kLevelTimeoutMs = 100;
+    // Thinking with no reply after this long (a merged or dropped turn) goes
+    // back to the device state, so the comet never stays up while listening.
+    static constexpr uint32_t kThinkingTimeoutMs = 15000;
+    // dBFS that maps to a closed and a fully open mouth. Tune on the board.
+    static constexpr float kLevelFloorDb = -45.0f;
+    static constexpr float kLevelRangeDb = 35.0f;
+
+    lv_obj_t* face_ = nullptr;
+    DeviceState device_state_ = kDeviceStateStarting;
+    FaceLayer layer_ = FaceLayer::kNone;
+    uint32_t thinking_since_ms_ = 0;
+    std::atomic<float> level_{0.0f};
+    // Milliseconds, 32 bits so the store is a single word on this chip.
+    std::atomic<uint32_t> level_ms_{0};
+
+    static bool IsErrorEmotion(const char* emotion) {
+        return emotion != nullptr &&
+               (strcmp(emotion, "warning") == 0 || strcmp(emotion, "cancel") == 0 ||
+                strcmp(emotion, "cloud_off") == 0);
+    }
+
+    // Under the display lock.
+    void Apply() {
+        jako_face_state_t state = JAKO_FACE_STATE_IDLE;
+        if (layer_ == FaceLayer::kError) {
+            state = JAKO_FACE_STATE_ERROR;
+        } else if (layer_ == FaceLayer::kThinking) {
+            state = JAKO_FACE_STATE_THINKING;
+        } else {
+            switch (device_state_) {
+                case kDeviceStateListening:
+                    state = JAKO_FACE_STATE_LISTENING;
+                    break;
+                case kDeviceStateSpeaking:
+                case kDeviceStateNotifying:  // Notifying plays Jako's voice
+                    state = JAKO_FACE_STATE_SPEAKING;
+                    break;
+                case kDeviceStateFatalError:
+                    state = JAKO_FACE_STATE_ERROR;
+                    break;
+                default:
+                    state = JAKO_FACE_STATE_IDLE;
+                    break;
+            }
+        }
+        jako_face_set_state(face_, state);
+    }
+
+    // Runs inside the face's LVGL timer, which already holds the lock.
+    static void PreTick(lv_obj_t* face, void* user) {
+        auto* self = static_cast<CustomLcdDisplay*>(user);
+        const uint32_t at = self->level_ms_.load(std::memory_order_acquire);
+        const float rms = self->level_.load(std::memory_order_relaxed);
+        const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (self->layer_ == FaceLayer::kThinking && now - self->thinking_since_ms_ > kThinkingTimeoutMs) {
+            self->layer_ = FaceLayer::kNone;
+            self->Apply();
+        }
+        float level = 0.0f;
+        if (now - at <= kLevelTimeoutMs && rms > 0.0f) {
+            level = (20.0f * log10f(rms) - kLevelFloorDb) / kLevelRangeDb;
+            level = level < 0.0f ? 0.0f : (level > 1.0f ? 1.0f : level);
+        }
+        jako_face_set_mouth_level(face, level);
     }
 };
 

@@ -25,6 +25,44 @@
 
 #define TAG "AudioService"
 
+namespace {
+
+// The RMS of a frame of 16-bit samples, 0 to 32768, in integers only. Every
+// second sample is enough for a mouth level and halves the cost (about 720
+// multiplies for a 60 ms frame at 24 kHz). No allocation, no locks.
+uint32_t FrameRms(const std::vector<int16_t>& pcm) {
+    const size_t n = pcm.size();
+    if (n == 0) {
+        return 0;
+    }
+    uint64_t sum = 0;
+    size_t count = 0;
+    for (size_t i = 0; i < n; i += 2) {
+        const int32_t s = pcm[i];
+        sum += (uint64_t)(s * s);
+        count++;
+    }
+    uint32_t mean = (uint32_t)(sum / count);  // at most 2^30
+    // Integer square root, bit by bit.
+    uint32_t root = 0;
+    uint32_t bit = 1u << 30;
+    while (bit > mean) {
+        bit >>= 2;
+    }
+    while (bit != 0) {
+        if (mean >= root + bit) {
+            mean -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+        bit >>= 2;
+    }
+    return root;
+}
+
+}  // namespace
+
 AudioService::AudioService() { event_group_ = xEventGroupCreate(); }
 
 AudioService::~AudioService() {
@@ -348,7 +386,13 @@ void AudioService::AudioOutputTask() {
             callbacks_.on_playback_progress(task.playback_id, task.media_position_ms);
         }
 
+        // Measured before the codec sees the frame, published after it has
+        // been written, so the face's mouth does not run ahead of the voice.
+        const uint32_t output_rms = FrameRms(task.pcm);
         codec_->OutputData(task.pcm);
+        if (callbacks_.on_output_level) {
+            callbacks_.on_output_level((float)output_rms / 32768.0f);
+        }
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();

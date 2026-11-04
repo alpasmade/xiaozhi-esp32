@@ -96,6 +96,7 @@ void Application::Initialize() {
     callbacks.on_playback_progress = [this](uint32_t playback_id, uint32_t media_position_ms) {
         notify_player_.OnPlaybackProgress(playback_id, media_position_ms);
     };
+    callbacks.on_output_level = [display](float level) { display->SetAudioLevel(level); };
     audio_service_.SetCallbacks(callbacks);
 
     // Add state change listeners
@@ -1026,6 +1027,7 @@ void Application::HandleStateChangedEvent() {
 
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
+    display->SetDeviceState(new_state);
     auto led = board.GetLed();
     led->OnStateChanged();
 

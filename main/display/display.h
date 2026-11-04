@@ -1,6 +1,7 @@
 #ifndef DISPLAY_H
 #define DISPLAY_H
 
+#include "device_state.h"
 #include "emoji_collection.h"
 #include "text_glyph.h"
 
@@ -56,6 +57,11 @@ public:
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
+    // The device state, from Application::HandleStateChangedEvent on the main task.
+    virtual void SetDeviceState(DeviceState state) { (void)state; }
+    // The RMS of the frame just played, 0 to 1, called from the audio output task.
+    // Overrides must not block or lock: store the value and read it elsewhere.
+    virtual void SetAudioLevel(float level) { (void)level; }
     virtual bool AddTextGlyphs(const std::vector<TextGlyph>& glyphs, uint8_t bpp) { return false; }
     virtual void ClearTextGlyphs() {}
     virtual void SetEmojiCollection(std::shared_ptr<EmojiCollection>) {}

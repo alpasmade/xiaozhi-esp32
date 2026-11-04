@@ -87,6 +87,8 @@ struct AudioServiceCallbacks {
     // Fired when the decode/playback queues and their in-flight work are drained.
     std::function<void(void)> on_playback_drained;
     std::function<void(uint32_t playback_id, uint32_t media_position_ms)> on_playback_progress;
+    // The RMS of each frame just played, 0 to 1, on the audio output task. Must not block.
+    std::function<void(float level)> on_output_level;
 };
 
 enum AudioTaskType {
