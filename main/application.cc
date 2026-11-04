@@ -35,6 +35,10 @@ Application::Application() : notify_player_(audio_service_) {
     aec_mode_ = kAecOff;
 #endif
 
+    // Voice wake is on unless the user turned it off; NVS is up before this runs.
+    voice_wake_enabled_ = Settings("wake", false).GetInt("voice", 1) != 0;
+    audio_service_.SetWakeWordAllowed(voice_wake_enabled_);
+
     esp_timer_create_args_t clock_timer_args = {.callback =
                                                     [](void* arg) {
                                                         Application* app = (Application*)arg;
@@ -924,6 +928,11 @@ void Application::HandleWakeWordDetectedEvent() {
     if (!protocol_) {
         return;
     }
+    // Drop a detection queued before voice wake was switched off.
+    if (!voice_wake_enabled_) {
+        ESP_LOGI(TAG, "Wake word ignored: voice wake is off");
+        return;
+    }
 
     auto state = GetDeviceState();
     auto wake_word = audio_service_.GetLastWakeWord();
@@ -1448,6 +1457,35 @@ void Application::SetAecMode(AecMode mode) {
         // If the AEC mode is changed, close the audio channel
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
             protocol_->CloseAudioChannel();
+        }
+    });
+}
+
+void Application::SetVoiceWakeEnabled(bool enabled) {
+    voice_wake_enabled_ = enabled;
+    // The gate closes at once, so a state change racing this call cannot arm the word.
+    audio_service_.SetWakeWordAllowed(enabled);
+    // Button callbacks run on the timer task; do the rest on the main task.
+    Schedule([this, enabled]() {
+        {
+            Settings settings("wake", true);
+            settings.SetInt("voice", enabled ? 1 : 0);
+        }
+        if (GetDeviceState() == kDeviceStateIdle) {
+            audio_service_.EnableWakeWordDetection(enabled);
+        }
+        ESP_LOGI(TAG, "Voice wake %s", enabled ? "on" : "off");
+        // The cue plays only while idle, so it never lands inside a notification.
+        if (GetDeviceState() != kDeviceStateIdle) {
+            return;
+        }
+        if (!enabled) {
+            audio_service_.PlaySound(Lang::Sounds::OGG_VIBRATION);
+        } else if (!audio_service_.IsWakeWordRunning()) {
+            // Switched on, but this build or model has no wake word to arm.
+            audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+        } else {
+            audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
         }
     });
 }

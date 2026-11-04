@@ -116,16 +116,50 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
         return false;
     }
 
+    if (commands_.empty()) {
+        ESP_LOGE(TAG, "No wake phrase configured for multinet model %s", mn_name_);
+        return false;
+    }
+
     multinet_ = esp_mn_handle_from_name(mn_name_);
+    if (multinet_ == nullptr) {
+        ESP_LOGE(TAG, "No multinet handle for model %s", mn_name_);
+        return false;
+    }
     multinet_model_data_ = multinet_->create(mn_name_, duration_);
+    if (multinet_model_data_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create multinet model %s", mn_name_);
+        return false;
+    }
     multinet_->set_det_threshold(multinet_model_data_, threshold_);
     input_buffer_.reserve(multinet_->get_samp_chunksize(multinet_model_data_));
     esp_mn_commands_clear();
+    // A phrase the library rejects must fail loudly, or Jako never wakes by voice.
     for (int i = 0; i < commands_.size(); i++) {
-        esp_mn_commands_add(i + 1, commands_[i].command.c_str());
+        esp_err_t err = esp_mn_commands_add(i + 1, commands_[i].command.c_str());
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Wake phrase '%s' was rejected: %s", commands_[i].command.c_str(),
+                     esp_err_to_name(err));
+            return false;
+        }
     }
-    esp_mn_commands_update();
-    
+    // The error list belongs to the library; do not free it.
+    esp_mn_error_t* errors = esp_mn_commands_update();
+    if (errors != nullptr) {
+        for (int i = 0; i < errors->num; i++) {
+            ESP_LOGE(TAG, "Wake phrase '%s' could not be loaded",
+                     errors->phrases[i] != nullptr ? errors->phrases[i]->string : "?");
+        }
+        return false;
+    }
+    esp_mn_phrase_t* first = esp_mn_commands_get_from_index(0);
+    if (first == nullptr) {
+        ESP_LOGE(TAG, "Wake phrase '%s' is not active after update", commands_[0].command.c_str());
+        return false;
+    }
+    ESP_LOGI(TAG, "Wake phrase '%s', phonemes: %s", first->string,
+             first->phonemes != nullptr ? first->phonemes : "(none)");
+
     multinet_->print_active_speech_commands(multinet_model_data_);
 #if CONFIG_SEND_WAKE_WORD_DATA
     if (!wake_word_audio_cache_.Initialize(16000 * 2)) {

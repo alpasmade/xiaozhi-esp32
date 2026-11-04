@@ -346,17 +346,18 @@ private:
     CustomBacklight* backlight_;
     esp_io_expander_handle_t io_expander = NULL;
     PowerSaveTimer* power_save_timer_;
+    bool battery_seen_ = false;
+    bool last_discharging_ = false;
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // Dim after 60 s of quiet and never power off, so the wake word keeps listening.
+        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(20); });
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness(); });
-        power_save_timer_->OnShutdownRequest([this](){ 
-            pmic_->PowerOff(); });
         power_save_timer_->SetEnabled(true);
     }
 
@@ -409,14 +410,14 @@ private:
             app.ToggleChatState();
         });
 
-#if CONFIG_USE_DEVICE_AEC
+        // Double click turns voice wake on or off; the choice is stored.
         boot_button_.OnDoubleClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateIdle) {
-                app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
+                power_save_timer_->WakeUp();
+                app.SetVoiceWakeEnabled(!app.IsVoiceWakeEnabled());
             }
         });
-#endif
     }
 
     void InitializeDisplay() {
@@ -547,13 +548,13 @@ public:
     }
 
     virtual bool GetBatteryLevel(int &level, bool &charging, bool &discharging) override {
-        static bool last_discharging = false;
         charging = pmic_->IsCharging();
         discharging = pmic_->IsDischarging();
-        if (discharging != last_discharging)
-        {
+        // The first read always applies, so a device booted on the charger is handled too.
+        if (!battery_seen_ || discharging != last_discharging_) {
             power_save_timer_->SetEnabled(discharging);
-            last_discharging = discharging;
+            last_discharging_ = discharging;
+            battery_seen_ = true;
         }
 
         level = pmic_->GetBatteryLevel();

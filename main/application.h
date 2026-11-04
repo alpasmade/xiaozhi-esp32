@@ -6,6 +6,7 @@
 #include <freertos/task.h>
 #include <esp_timer.h>
 
+#include <atomic>
 #include <string>
 #include <mutex>
 #include <deque>
@@ -116,6 +117,9 @@ public:
     void RegisterMcpBroadcastCallback(std::function<void(const std::string&)> callback);
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
+    // Voice wake switch: stored, on by default. Safe to call from any task.
+    void SetVoiceWakeEnabled(bool enabled);
+    bool IsVoiceWakeEnabled() const { return voice_wake_enabled_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
     
@@ -139,6 +143,7 @@ private:
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
+    std::atomic<bool> voice_wake_enabled_{true};
     std::string last_error_message_;
     std::string startup_wake_word_hint_message_;
     AudioService audio_service_;

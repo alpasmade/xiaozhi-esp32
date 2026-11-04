@@ -707,6 +707,10 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
 }
 
 void AudioService::EnableWakeWordDetection(bool enable) {
+    // One gate for every caller: voice wake switched off means never armed.
+    if (enable && !wake_word_allowed_) {
+        enable = false;
+    }
     ESP_LOGD(TAG, "%s wake word detection", enable ? "Enabling" : "Disabling");
     if (enable) {
         if (!InitializeAudioEngine()) {

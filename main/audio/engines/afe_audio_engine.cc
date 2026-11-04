@@ -92,10 +92,10 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
             }
         });
         if (!custom_wake_word_->Initialize(codec_, models_)) {
-            ESP_LOGE(TAG, "Failed to initialize MultiNet wake-word detector");
+            // Carry on without a wake word so the button still opens a conversation.
+            ESP_LOGE(TAG, "Failed to initialize MultiNet wake-word detector; continuing without one");
             custom_wake_word_.reset();
             wake_detector_ = WakeDetector::kNone;
-            return false;
         }
     } else if (wakenet_model_name != nullptr) {
         wake_detector_ = WakeDetector::kWakeNet;

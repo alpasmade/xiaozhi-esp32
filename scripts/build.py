@@ -35,6 +35,13 @@ _WAKE_WORD_TARGETS = (
     "esp32s31",
 )
 _WAKE_WORD_MODEL_PATTERN = re.compile(r"^wn9[sl]?_[a-z0-9_]+$")
+# A custom wake phrase runs through the MultiNet7 command recogniser.
+_CUSTOM_WAKE_WORD_PHRASE_PATTERN = re.compile(r"^[a-z]+( [a-z]+)*$")
+_CUSTOM_WAKE_WORD_MODELS = {
+    "en": "CONFIG_SR_MN_EN_MULTINET7_QUANT",
+    "zh": "CONFIG_SR_MN_CN_MULTINET7_QUANT",
+}
+_CUSTOM_WAKE_WORD_KEYS = {"phrase", "display", "language", "threshold"}
 _ESP_SR_KCONFIG = Path(
     "managed_components/espressif__esp-sr/Kconfig.projbuild"
 )
@@ -295,7 +302,7 @@ def _print_wake_word_list(wake_words: list[dict[str, object]]) -> None:
             f"{str(item['model']):<{model_width}}  "
             f"{str(item['phrase']):<{phrase_width}}  {targets}"
         )
-    print("\nSpecial values: nihaoxiaozhi, hiesp, disabled")
+    print("\nSpecial values: nihaoxiaozhi, hiesp, disabled, custom")
 
 
 def _board_supports_wake_word(
@@ -375,6 +382,78 @@ def _wake_word_sdkconfig_options(
     model_symbol = f"CONFIG_SR_WN_{normalized.upper()}"
     options.extend((f"{implementation}=y", f"{model_symbol}=y"))
     return normalized, options, [implementation, model_symbol]
+
+
+def _custom_wake_word_sdkconfig_options(
+    spec: object,
+    target: str,
+) -> tuple[str, list[str], list[str], list[str]]:
+    """Map a build entry's custom_wake_word object to MultiNet Kconfig options.
+
+    Returns the summary label, the sdkconfig options, the bool symbols Kconfig
+    must accept, and the exact value lines the generated sdkconfig must hold.
+    """
+    if not isinstance(spec, dict):
+        raise ValueError("custom_wake_word must be a JSON object")
+    unknown = set(spec) - _CUSTOM_WAKE_WORD_KEYS
+    if unknown:
+        raise ValueError(
+            f"custom_wake_word has unknown keys: {', '.join(sorted(unknown))}"
+        )
+
+    phrase = spec.get("phrase")
+    if not isinstance(phrase, str) or not _CUSTOM_WAKE_WORD_PHRASE_PATTERN.fullmatch(phrase):
+        raise ValueError(
+            f"custom_wake_word phrase {phrase!r} must be lower-case words "
+            "separated by single spaces, for example 'hey jako'"
+        )
+    display = spec.get("display")
+    if (
+        not isinstance(display, str)
+        or not display.strip()
+        or any(char in display for char in '"\\\n\r')
+    ):
+        raise ValueError(
+            f"custom_wake_word display {display!r} must be a non-empty string "
+            "without quotes, backslashes or line breaks"
+        )
+    threshold = spec.get("threshold", 20)
+    if isinstance(threshold, bool) or not isinstance(threshold, int) or not 1 <= threshold <= 99:
+        raise ValueError(
+            f"custom_wake_word threshold {threshold!r} must be an integer from 1 to 99"
+        )
+    language = spec.get("language", "en")
+    if language not in _CUSTOM_WAKE_WORD_MODELS:
+        raise ValueError(
+            f"custom_wake_word language {language!r} must be one of "
+            f"{', '.join(sorted(_CUSTOM_WAKE_WORD_MODELS))}"
+        )
+    if target not in _AFE_WAKE_WORD_TARGETS:
+        raise ValueError(
+            f"A custom wake word needs an ESP32-S3, ESP32-P4 or ESP32-S31 "
+            f"with PSRAM; target {target} is not supported"
+        )
+
+    model_symbol = _CUSTOM_WAKE_WORD_MODELS[language]
+    values = [
+        f'CONFIG_CUSTOM_WAKE_WORD="{phrase}"',
+        f'CONFIG_CUSTOM_WAKE_WORD_DISPLAY="{display}"',
+        f"CONFIG_CUSTOM_WAKE_WORD_THRESHOLD={threshold}",
+    ]
+    options = [
+        "CONFIG_WAKE_WORD_DISABLED=n",
+        "CONFIG_USE_ESP_WAKE_WORD=n",
+        "CONFIG_USE_AFE_WAKE_WORD=n",
+        "CONFIG_USE_CUSTOM_WAKE_WORD=y",
+        *values,
+        f"{model_symbol}=y",
+    ]
+    return (
+        f"custom {phrase}",
+        options,
+        ["CONFIG_USE_CUSTOM_WAKE_WORD", model_symbol],
+        values,
+    )
 
 ################################################################################
 # board / variant related functions
@@ -1477,6 +1556,22 @@ def _validate_configured_symbols(symbols: list[str], option_name: str) -> None:
         )
 
 
+def _validate_configured_values(lines: list[str], option_name: str) -> None:
+    """Ensure Kconfig kept each requested string or int value exactly."""
+    if not lines:
+        return
+    sdkconfig = Path("sdkconfig")
+    if not sdkconfig.exists():
+        raise RuntimeError(f"Cannot validate {option_name}: sdkconfig was not generated")
+    configured = set(sdkconfig.read_text(encoding="utf-8").splitlines())
+    missing = [line for line in lines if line not in configured]
+    if missing:
+        raise ValueError(
+            f"{option_name} was changed or dropped by Kconfig; "
+            f"expected: {', '.join(missing)}"
+        )
+
+
 def _validate_configured_options(options: list[str], option_name: str) -> None:
     """Ensure Kconfig accepted each requested y/n semantic build option."""
     if not options:
@@ -1613,17 +1708,40 @@ def build_board(
         )
         wake_word_supported = _board_supports_wake_word(target, sdkconfig_append)
         requested_wake_word = wake_word
-        if requested_wake_word is None:
-            requested_wake_word = "disabled"
-            if wake_word_supported:
-                requested_wake_word = (
-                    "nihaoxiaozhi" if selected_language in {"zh-CN", "zh-TW"} else "hiesp"
-                )
-        (
-            selected_wake_word,
-            wake_word_options,
-            wake_word_symbols,
-        ) = _wake_word_sdkconfig_options(requested_wake_word, target)
+        custom_wake_word = build.get("custom_wake_word")
+        # An explicit --wake-word wins; with none, the entry's custom phrase
+        # wins over the language default.
+        use_custom_wake_word = (
+            requested_wake_word is not None
+            and requested_wake_word.strip().casefold() == "custom"
+        )
+        if use_custom_wake_word and custom_wake_word is None:
+            raise ValueError(
+                f"--wake-word custom needs a custom_wake_word object in the "
+                f"{name!r} build entry of {cfg_path}"
+            )
+        if requested_wake_word is None and custom_wake_word is not None:
+            use_custom_wake_word = True
+        wake_word_values: list[str] = []
+        if use_custom_wake_word:
+            (
+                selected_wake_word,
+                wake_word_options,
+                wake_word_symbols,
+                wake_word_values,
+            ) = _custom_wake_word_sdkconfig_options(custom_wake_word, target)
+        else:
+            if requested_wake_word is None:
+                requested_wake_word = "disabled"
+                if wake_word_supported:
+                    requested_wake_word = (
+                        "nihaoxiaozhi" if selected_language in {"zh-CN", "zh-TW"} else "hiesp"
+                    )
+            (
+                selected_wake_word,
+                wake_word_options,
+                wake_word_symbols,
+            ) = _wake_word_sdkconfig_options(requested_wake_word, target)
         if selected_wake_word != "disabled" and not wake_word_supported:
             raise ValueError(
                 f"Wake-word detection is disabled or unsupported for {final_name!r}; "
@@ -1681,6 +1799,7 @@ def build_board(
         )
         for symbols, option_name in validation_symbols:
             _validate_configured_symbols(symbols, option_name)
+        _validate_configured_values(wake_word_values, "custom_wake_word")
         _validate_configured_options(build_option_sdkconfig, "--build-options-json")
 
         # build.name is the compatibility-sensitive OTA-reported board identity.
@@ -1781,8 +1900,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         metavar="MODEL",
         help=(
             "Wake-word model (for example wn9_jarvis_tts), "
-            "'nihaoxiaozhi', 'hiesp', or 'disabled'. Defaults to nihaoxiaozhi "
-            "for zh-CN/zh-TW and hiesp otherwise; disabled on unsupported boards"
+            "'nihaoxiaozhi', 'hiesp', 'disabled', or 'custom' (the build "
+            "entry's custom_wake_word phrase). Defaults to the entry's "
+            "custom_wake_word if it has one, else nihaoxiaozhi for "
+            "zh-CN/zh-TW and hiesp otherwise; disabled on unsupported boards"
         ),
     )
     parser.add_argument(

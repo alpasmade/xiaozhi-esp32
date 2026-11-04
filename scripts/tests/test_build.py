@@ -1457,12 +1457,23 @@ class LanguageBuildTests(unittest.TestCase):
             mock.patch.object(build, "_configure_build") as configure,
             mock.patch.object(build, "_validate_configured_symbols") as validate,
             mock.patch.object(build, "_validate_configured_options"),
+            mock.patch.object(build, "_validate_configured_values"),
             mock.patch.object(build, "_run_idf"),
             mock.patch.object(build, "merge_bin"),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
             yield prepare, configure, validate
+
+    @staticmethod
+    def custom_wake_word(variant):
+        config = json.loads(
+            (ROOT / "main/boards" / variant["board"] / "config.json").read_text(encoding="utf-8")
+        )
+        for entry in config.get("builds", []):
+            if build._get_reported_name(entry) == variant["name"]:
+                return entry.get("custom_wake_word")
+        return None
 
     def test_all_variants_default_to_english_and_accept_every_language(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -1500,7 +1511,24 @@ class LanguageBuildTests(unittest.TestCase):
                         )
                         validate.assert_any_call([expected.split("=", 1)[0]], "--language")
                         models = [item for item in fragment if item.startswith("CONFIG_SR_WN_")]
-                        if variant["wake_word_supported"]:
+                        custom = self.custom_wake_word(variant)
+                        if custom is not None:
+                            model_symbol = (
+                                "CONFIG_SR_MN_CN_MULTINET7_QUANT"
+                                if custom.get("language", "en") == "zh"
+                                else "CONFIG_SR_MN_EN_MULTINET7_QUANT"
+                            )
+                            self.assertEqual(models, [])
+                            self.assertIn("CONFIG_USE_CUSTOM_WAKE_WORD=y", fragment)
+                            self.assertIn(
+                                f'CONFIG_CUSTOM_WAKE_WORD="{custom["phrase"]}"', fragment
+                            )
+                            self.assertIn(f"{model_symbol}=y", fragment)
+                            validate.assert_any_call(
+                                ["CONFIG_USE_CUSTOM_WAKE_WORD", model_symbol],
+                                "--wake-word",
+                            )
+                        elif variant["wake_word_supported"]:
                             chinese = language in {"zh-CN", "zh-TW"}
                             if target in {"esp32c3", "esp32c5", "esp32c6"}:
                                 model = "WN9S_NIHAOXIAOZHI" if chinese else "WN9S_HIESP"
@@ -1589,6 +1617,148 @@ class LanguageBuildTests(unittest.TestCase):
             fragment = configure.call_args.args[1]
             self.assertIn("CONFIG_WAKE_WORD_DISABLED=y", fragment)
             self.assertFalse(any(item.startswith("CONFIG_SR_WN_") for item in fragment))
+
+
+class CustomWakeWordTests(unittest.TestCase):
+    BOARD = "waveshare/esp32-s3-touch-amoled-1.75"
+    CUSTOM = "esp32-s3-touch-amoled-1.75c"
+    PLAIN = "esp32-s3-touch-amoled-1.75"
+    SPEC = {"phrase": "hey jako", "display": "Hey Jako", "language": "en", "threshold": 20}
+
+    mock_idf = LanguageBuildTests.mock_idf
+
+    def test_valid_object_maps_to_multinet_options(self):
+        label, options, symbols, values = build._custom_wake_word_sdkconfig_options(
+            self.SPEC, "esp32s3"
+        )
+        self.assertEqual(label, "custom hey jako")
+        self.assertEqual(options, [
+            "CONFIG_WAKE_WORD_DISABLED=n",
+            "CONFIG_USE_ESP_WAKE_WORD=n",
+            "CONFIG_USE_AFE_WAKE_WORD=n",
+            "CONFIG_USE_CUSTOM_WAKE_WORD=y",
+            'CONFIG_CUSTOM_WAKE_WORD="hey jako"',
+            'CONFIG_CUSTOM_WAKE_WORD_DISPLAY="Hey Jako"',
+            "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20",
+            "CONFIG_SR_MN_EN_MULTINET7_QUANT=y",
+        ])
+        keys = [option.split("=", 1)[0] for option in options]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertEqual(symbols, ["CONFIG_USE_CUSTOM_WAKE_WORD", "CONFIG_SR_MN_EN_MULTINET7_QUANT"])
+        self.assertEqual(values, options[4:7])
+
+        _, options, symbols, _ = build._custom_wake_word_sdkconfig_options(
+            {**self.SPEC, "phrase": "xiao tu dou", "language": "zh"}, "esp32s3"
+        )
+        self.assertIn("CONFIG_SR_MN_CN_MULTINET7_QUANT=y", options)
+        self.assertIn("CONFIG_SR_MN_CN_MULTINET7_QUANT", symbols)
+
+    def test_bad_objects_are_rejected(self):
+        for spec, message in (
+            ({**self.SPEC, "phrase": "Hey Jako"}, "phrase"),
+            ({**self.SPEC, "phrase": "hey  jako"}, "phrase"),
+            ({**self.SPEC, "phrase": "hey jako!"}, "phrase"),
+            ({**self.SPEC, "display": ""}, "display"),
+            ({**self.SPEC, "display": 'Hey "Jako"'}, "display"),
+            ({**self.SPEC, "threshold": 0}, "threshold"),
+            ({**self.SPEC, "threshold": 100}, "threshold"),
+            ({**self.SPEC, "threshold": "20"}, "threshold"),
+            ({**self.SPEC, "threshold": True}, "threshold"),
+            ({**self.SPEC, "language": "de"}, "language"),
+            ({**self.SPEC, "pronunciation": "jah ko"}, "unknown keys"),
+            ("hey jako", "JSON object"),
+        ):
+            with self.subTest(spec=spec):
+                with self.assertRaisesRegex(ValueError, message):
+                    build._custom_wake_word_sdkconfig_options(spec, "esp32s3")
+
+    def test_non_afe_target_is_rejected(self):
+        for target in ("esp32", "esp32c3", "esp32c6"):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(ValueError, "not supported"):
+                    build._custom_wake_word_sdkconfig_options(self.SPEC, target)
+
+    def test_board_entry_object_is_the_default(self):
+        with self.mock_idf() as (_, configure, validate):
+            build.build_board(self.BOARD, name_filter=self.CUSTOM, idf_version=(6, 1, 0))
+            fragment = configure.call_args.args[1]
+            self.assertIn("CONFIG_USE_CUSTOM_WAKE_WORD=y", fragment)
+            self.assertIn('CONFIG_CUSTOM_WAKE_WORD="hey jako"', fragment)
+            self.assertIn('CONFIG_CUSTOM_WAKE_WORD_DISPLAY="Hey Jako"', fragment)
+            self.assertIn("CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20", fragment)
+            self.assertIn("CONFIG_SR_MN_EN_MULTINET7_QUANT=y", fragment)
+            self.assertFalse(any(item.startswith("CONFIG_SR_WN_") for item in fragment))
+            self.assertIn("CONFIG_USE_AFE_WAKE_WORD=n", fragment)
+            keys = [item.split("=", 1)[0] for item in fragment]
+            self.assertEqual(len(keys), len(set(keys)))
+            validate.assert_any_call(
+                ["CONFIG_USE_CUSTOM_WAKE_WORD", "CONFIG_SR_MN_EN_MULTINET7_QUANT"],
+                "--wake-word",
+            )
+
+            build.build_board(self.BOARD, name_filter=self.CUSTOM, wake_word="custom",
+                              idf_version=(6, 1, 0))
+            self.assertIn("CONFIG_USE_CUSTOM_WAKE_WORD=y", configure.call_args.args[1])
+
+    def test_custom_values_are_checked_after_configure(self):
+        with self.mock_idf():
+            values = build._validate_configured_values
+            build.build_board(self.BOARD, name_filter=self.CUSTOM, idf_version=(6, 1, 0))
+            values.assert_called_once_with([
+                'CONFIG_CUSTOM_WAKE_WORD="hey jako"',
+                'CONFIG_CUSTOM_WAKE_WORD_DISPLAY="Hey Jako"',
+                "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20",
+            ], "custom_wake_word")
+
+    def test_value_check_reads_the_generated_sdkconfig(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = os.getcwd()
+            os.chdir(directory)
+            try:
+                Path("sdkconfig").write_text(
+                    'CONFIG_CUSTOM_WAKE_WORD="hey jako"\n'
+                    "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=99\n",
+                    encoding="utf-8",
+                )
+                build._validate_configured_values(['CONFIG_CUSTOM_WAKE_WORD="hey jako"'], "x")
+                with self.assertRaisesRegex(ValueError, "THRESHOLD=20"):
+                    build._validate_configured_values(
+                        ["CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20"], "x"
+                    )
+            finally:
+                os.chdir(cwd)
+
+    def test_custom_without_object_is_rejected(self):
+        with self.mock_idf() as (prepare, configure, _):
+            with self.assertRaisesRegex(ValueError, "custom_wake_word object"):
+                build.build_board(self.BOARD, name_filter=self.PLAIN, wake_word="custom",
+                                  idf_version=(6, 1, 0))
+            prepare.assert_not_called()
+            configure.assert_not_called()
+
+    def test_plain_variant_keeps_hiesp(self):
+        with self.mock_idf() as (_, configure, _):
+            build.build_board(self.BOARD, name_filter=self.PLAIN, idf_version=(6, 1, 0))
+            fragment = configure.call_args.args[1]
+            self.assertIn("CONFIG_SR_WN_WN9_HIESP=y", fragment)
+            self.assertIn("CONFIG_USE_CUSTOM_WAKE_WORD=n", fragment)
+
+    def test_explicit_wake_word_overrides_the_object(self):
+        with self.mock_idf() as (_, configure, _):
+            for wake_word, expected in (
+                ("hiesp", "CONFIG_SR_WN_WN9_HIESP=y"),
+                ("wn9_jarvis_tts", "CONFIG_SR_WN_WN9_JARVIS_TTS=y"),
+                ("disabled", "CONFIG_WAKE_WORD_DISABLED=y"),
+            ):
+                with self.subTest(wake_word=wake_word):
+                    build.build_board(self.BOARD, name_filter=self.CUSTOM,
+                                      wake_word=wake_word, idf_version=(6, 1, 0))
+                    fragment = configure.call_args.args[1]
+                    self.assertIn(expected, fragment)
+                    self.assertIn("CONFIG_USE_CUSTOM_WAKE_WORD=n", fragment)
+                    self.assertFalse(any(item.startswith("CONFIG_CUSTOM_WAKE_WORD")
+                                         for item in fragment))
+                    self.assertFalse(any(item.startswith("CONFIG_SR_MN_") for item in fragment))
 
 
 class VariantSelectionTests(unittest.TestCase):
