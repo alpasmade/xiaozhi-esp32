@@ -101,7 +101,7 @@ static const jf_alias_t ALIASES[] = {
 /* STATE_COLOR in jako-face.js:17; -1 is no ring */
 static const int32_t STATE_COLOR[] = {
     [JAKO_FACE_STATE_IDLE] = -1,
-    [JAKO_FACE_STATE_LISTENING] = 0xC7F23F,
+    [JAKO_FACE_STATE_LISTENING] = 0xEEFF75,
     [JAKO_FACE_STATE_THINKING] = 0x4C6BFF,
     [JAKO_FACE_STATE_SPEAKING] = 0xFF6A2B,
     [JAKO_FACE_STATE_ERROR] = 0xFF6A2B,
