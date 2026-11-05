@@ -26,10 +26,13 @@
 #include <lvgl.h>
 
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 
+#include "jako_body.h"
 #include "jako_face.h"
+#include "jako_motion.h"
 
 #define TAG "WaveshareEsp32s3TouchAMOLED1inch75"
 
@@ -239,6 +242,23 @@ public:
         }
     }
 
+    // A reaction to the body (docs/body-events.md), from any task.
+    void BodyEvent(jako_face_body_event_t event) {
+        DisplayLockGuard lock(this);
+        if (face_ != nullptr) {
+            jako_face_body_event(face_, event);
+        }
+    }
+
+    // Tilt in the hand, for the board days: no trigger calls it yet. Set
+    // (0, 0) whenever the source stops, so a lean never sticks.
+    void SetLean(float x, float y) {
+        DisplayLockGuard lock(this);
+        if (face_ != nullptr) {
+            jako_face_set_lean(face_, x, y);
+        }
+    }
+
     // Called from the audio output task once per frame: no lock, no log.
     virtual void SetAudioLevel(float level) override {
         level_.store(level, std::memory_order_relaxed);
@@ -348,6 +368,29 @@ private:
     PowerSaveTimer* power_save_timer_;
     bool battery_seen_ = false;
     bool last_discharging_ = false;
+
+    // Body events (DESIGN-TRUTH.md section 5, docs/body-events.md). The
+    // reader's state is named, not a flag: it can be missing, refused or failed.
+    enum class MotionState { kOff, kNotFound, kChecking, kArmed, kRefused, kFailed };
+    // The whole motion reader. false turns it off in one line, and the device
+    // works exactly as it did before body events.
+    static constexpr bool kBodyMotionEnabled = true;
+    // A shake also stops Jako mid-reply. Off until the board shows false
+    // shakes are rare (docs/hardware-tests.md, "Shake stops speaking").
+    static constexpr bool kShakeStopsSpeaking = false;
+    // First guess, tune on the board: the poll period. A shake shows within
+    // this plus one 33 ms face tick (hardware test "The poll does not cost the face").
+    static constexpr uint32_t kMotionPollMs = 80;
+    // First guess, tune on the board: read errors in a row before the poll
+    // stops for good (hardware test "Failure containment").
+    static constexpr int kMotionMaxFailures = 5;
+
+    JakoMotion motion_;
+    jako_body_motion_t motion_body_ = {};
+    jako_body_power_t power_body_ = {};
+    MotionState motion_state_ = MotionState::kOff;
+    lv_timer_t* motion_timer_ = nullptr;
+    int motion_failures_ = 0;
 
     void InitializePowerSaveTimer() {
         // Dim after 60 s of quiet and never power off, so the wake word keeps listening.
@@ -495,6 +538,100 @@ private:
         ESP_LOGI(TAG, "Touch panel initialized successfully");
     }
 
+    // Body events. Nothing here can stop the device booting or talking: a
+    // missing or misread chip logs one line and leaves body motion off.
+    void InitializeBodyEvents() {
+        jako_body_power_init(&power_body_);
+        jako_body_motion_init(&motion_body_);
+        if (!kBodyMotionEnabled) {
+            ESP_LOGI(TAG, "Body motion off (kBodyMotionEnabled)");
+            return;
+        }
+        const esp_err_t ret = motion_.Start(i2c_bus_);
+        if (ret != ESP_OK) {
+            motion_state_ = MotionState::kNotFound;
+            ESP_LOGW(TAG, "Motion chip not found at 0x6A or 0x6B (%s); body motion off, everything else as before",
+                     esp_err_to_name(ret));
+            return;
+        }
+        ESP_LOGI(TAG, "Motion chip at 0x%02X, WHO_AM_I 0x05, revision 0x%02X", motion_.address(),
+                 motion_.revision());
+        {
+            // The LVGL port is running (InitializeDisplay); its timers need its lock.
+            DisplayLockGuard lock(display_);
+            motion_timer_ = lv_timer_create(MotionTick, kMotionPollMs, this);
+        }
+        if (motion_timer_ == nullptr) {
+            motion_.Stop();
+            motion_state_ = MotionState::kFailed;
+            ESP_LOGW(TAG, "No memory for the motion poll; body motion off, everything else as before");
+            return;
+        }
+        motion_state_ = MotionState::kChecking;
+    }
+
+    // Runs in the LVGL task, which already holds the display lock (the port's
+    // mutex is recursive): no new task, no new stack.
+    static void MotionTick(lv_timer_t* timer) {
+        auto* self = static_cast<WaveshareEsp32s3TouchAMOLED1inch75*>(lv_timer_get_user_data(timer));
+        if (self != nullptr) {
+            self->OnMotionTick();
+        }
+    }
+
+    void OnMotionTick() {
+        if (motion_state_ != MotionState::kChecking && motion_state_ != MotionState::kArmed) {
+            return;
+        }
+        uint8_t raw[6] = {};
+        if (motion_.Read(raw) != ESP_OK) {
+            jako_body_motion_gap(&motion_body_);
+            if (++motion_failures_ >= kMotionMaxFailures) {
+                StopMotion(MotionState::kFailed, "reads failed five times in a row");
+            }
+            return;
+        }
+        motion_failures_ = 0;
+        const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        const jako_body_event_t event = jako_body_motion_sample(&motion_body_, raw, now);
+        if (motion_body_.state == JAKO_BODY_MOTION_REFUSED) {
+            StopMotion(MotionState::kRefused, "readings never near 1 g in either byte order");
+            return;
+        }
+        if (motion_body_.state == JAKO_BODY_MOTION_ARMED && motion_state_ == MotionState::kChecking) {
+            motion_state_ = MotionState::kArmed;
+            int32_t mg[3] = {};
+            jako_body_motion_decode(&motion_body_, raw, mg);
+            ESP_LOGI(TAG, "Body motion armed, %s endian, x %" PRId32 " y %" PRId32 " z %" PRId32 " mg",
+                     motion_body_.order == JAKO_BODY_ORDER_LITTLE ? "little" : "big", mg[0], mg[1], mg[2]);
+        }
+        if (event == JAKO_BODY_SHAKE) {
+            ESP_LOGI(TAG, "Body: shake");
+            display_->BodyEvent(JAKO_FACE_BODY_DIZZY);
+            auto& app = Application::GetInstance();
+            if (kShakeStopsSpeaking && app.GetDeviceState() == kDeviceStateSpeaking) {
+                app.Schedule([]() {
+                    // Checked again: the state may have moved on by the time the main task runs this.
+                    auto& app = Application::GetInstance();
+                    if (app.GetDeviceState() == kDeviceStateSpeaking) {
+                        app.AbortSpeaking(kAbortReasonNone);
+                    }
+                });
+            }
+        }
+    }
+
+    // For good, until the next boot. In the LVGL task.
+    void StopMotion(MotionState state, const char* why) {
+        if (motion_timer_ != nullptr) {
+            lv_timer_pause(motion_timer_);
+        }
+        motion_.Stop();
+        motion_state_ = state;
+        display_->SetLean(0.0f, 0.0f);  // a lean never outlives its source
+        ESP_LOGW(TAG, "Body motion off: %s; everything else as before", why);
+    }
+
     // 初始化工具
     void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
@@ -520,6 +657,7 @@ public:
         InitializeTouch();
         InitializeButtons();
         InitializeTools();
+        InitializeBodyEvents();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -555,6 +693,16 @@ public:
             power_save_timer_->SetEnabled(discharging);
             last_discharging_ = discharging;
             battery_seen_ = true;
+        }
+        // Cable in and battery full, from the two reads above: no new register
+        // read. Only the main task gets here (the clock tick, and MCP tools,
+        // which Application::Schedule runs there), so no lock. The screen is
+        // already awake: SetEnabled(false) wakes it on cable in.
+        const jako_body_event_t body = jako_body_power_sample(&power_body_, charging, discharging,
+                                                              (uint32_t)(esp_timer_get_time() / 1000));
+        if (body == JAKO_BODY_CABLE_IN || body == JAKO_BODY_BATTERY_FULL) {
+            ESP_LOGI(TAG, "Body: %s", body == JAKO_BODY_CABLE_IN ? "cable in" : "battery full");
+            display_->BodyEvent(JAKO_FACE_BODY_HAPPY);
         }
 
         level = pmic_->GetBatteryLevel();

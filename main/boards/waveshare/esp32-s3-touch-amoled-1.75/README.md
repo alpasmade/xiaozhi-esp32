@@ -13,3 +13,5 @@ In the smaller form, the 1.75-inch capacitive HD AMOLED screen, highly integrate
 | <img style="width: 150px; height: auto; display: block; margin: 0 auto;" src= "https://www.waveshare.com/media/catalog/product/cache/1/image/560x560/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-amoled-1.75-b-3.jpg"> |
 | <img style="width: 150px; height: auto; display: block; margin: 0 auto;" src= "https://www.waveshare.com/media/catalog/product/cache/1/image/560x560/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-amoled-1.75-b-1.jpg"> |
 
+
+Jakomotchi: Jako's face (jako_face.c) and body events (jako_body.c, jako_motion.cc: shake, cable in, battery full) live in this folder; see docs/body-events.md in the Jakomotchi repository.

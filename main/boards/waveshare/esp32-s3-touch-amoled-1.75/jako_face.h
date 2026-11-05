@@ -27,7 +27,9 @@ typedef enum {
 } jako_face_state_t;
 
 typedef enum {
-    JAKO_FACE_BODY_DIZZY = 0, /* dizzy for 2 s of face time, above error */
+    JAKO_FACE_BODY_DIZZY = 0, /* dizzy for 2 s of face time, above error (shake) */
+    JAKO_FACE_BODY_HAPPY,     /* happy for 2 s of face time, above error (cable in, battery full) */
+    JAKO_FACE_BODY_BLINK,     /* one blink now, under the natural blink's rules (picked up) */
 } jako_face_body_event_t;
 
 typedef enum {
@@ -69,6 +71,9 @@ typedef struct {
     float mouth_open;
     bool hearts;
     float time;
+    const char* body;         /* timed body reaction: "none", "dizzy" or "happy" */
+    float body_left;          /* seconds of it left */
+    float lean_x, lean_y;     /* the held lean in units, after the clamp */
 } jako_face_debug_t;
 
 typedef void (*jako_face_pre_tick_cb_t)(lv_obj_t* face, void* user);
@@ -85,7 +90,18 @@ void jako_face_set_mouth_level(lv_obj_t* face, float level01);
 void jako_face_set_reduced_motion(lv_obj_t* face, bool on);
 /* Power save: sleepy, but only while idle with the neutral expression. */
 void jako_face_set_rest(lv_obj_t* face, bool on);
+/* A reaction to the body. DIZZY and HAPPY show for 2 s of face time above
+   error, then the session's expression and state return; a new one replaces
+   a running one and starts its 2 s again. BLINK blinks once now, unless the
+   drawn face may not blink (error, sleepy, wink, love), the natural blink's
+   rule. Unknown events are ignored. */
 void jako_face_body_event(lv_obj_t* face, jako_face_body_event_t event);
+/* Tilt in the hand: while idle and not under reduced motion, the eyes look
+   toward (x, y) units instead of glancing, eased at the glance rate. The
+   vector is clamped to a length of 0.6; anything not finite reads as 0.
+   (0, 0) lets the glance return. Whoever drives it sets (0, 0) when its
+   source stops, so a lean never sticks. */
+void jako_face_set_lean(lv_obj_t* face, float x, float y);
 /* Jump every easing to its target, as snap() in the engine. */
 void jako_face_snap(lv_obj_t* face);
 /* Seed for blinks and glances (xorshift32). Zero is replaced by one. */

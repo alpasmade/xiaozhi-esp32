@@ -5,6 +5,7 @@ day. The product's own changelog is in the Jakomotchi repository.
 
 ## 2026-11-05
 
+- Waveshare ESP32-S3 Touch AMOLED 1.75 and 1.75C: body events. The face gains a happy body reaction (2 s above error, like dizzy), a body blink and a lean (jako_face_body_event, jako_face_set_lean). New in the board folder: jako_body.c and its header (plain C detectors for shake, cable in and battery full, tested on the Mac), jako_motion.cc and its header (the QMI8658 accelerometer on the shared I2C bus, probed at 0x6A and 0x6B, every call returning an error). The board polls the chip every 80 ms from an LVGL timer: a shake shows dizzy; stopping speech on a shake is written and off (kShakeStopsSpeaking). Cable in and battery full show happy, from the charging flags GetBatteryLevel already reads. A missing, misread or failing chip logs one line and leaves the device as before; kBodyMotionEnabled turns motion off. No shared files changed.
 - Waveshare ESP32-S3 Touch AMOLED 1.75 and 1.75C: Jako's listening ring is the studio's neon #EEFF75 in place of the green #C7F23F (the listening entry of STATE_COLOR in jako_face.c, matching the face engine in the Jakomotchi repository). The thinking, speaking and error colours, the ring's geometry and its timing are unchanged.
 
 ## 2026-11-04

@@ -40,7 +40,9 @@
 #define JF_RING_OPA_STEP 8
 #define JF_TICK_MS 33
 #define JF_DT_MAX 0.05f
-#define JF_BODY_DIZZY_S 2.0f
+#define JF_BODY_DIZZY_S 2.0f /* DESIGN-TRUTH section 5: dizzy for 2 s */
+#define JF_BODY_HAPPY_S 2.0f /* DESIGN-TRUTH section 5: happy for 2 s */
+#define JF_LEAN_MAX 0.6f     /* DESIGN-TRUTH section 5: the eyes slide up to 0.6 units */
 #define JF_HEART_REF_PX 466
 #define JF_MOUTH_ATTACK_S 0.030f
 #define JF_MOUTH_RELEASE_S 0.080f
@@ -107,7 +109,7 @@ static const int32_t STATE_COLOR[] = {
     [JAKO_FACE_STATE_ERROR] = 0xFF6A2B,
 };
 
-typedef enum { JF_BODY_NONE = 0, JF_BODY_DIZZY } jf_body_t;
+typedef enum { JF_BODY_NONE = 0, JF_BODY_DIZZY, JF_BODY_HAPPY } jf_body_t;
 typedef enum { JF_GEOM_NONE = 0, JF_GEOM_READY } jf_geom_state_t;
 typedef enum { JF_EYE_NONE = 0, JF_EYE_BLOCK, JF_EYE_HEART } jf_eye_kind_t;
 typedef enum { JF_MG_NONE = 0, JF_MG_ARC, JF_MG_RECT } jf_mouth_kind_t;
@@ -173,6 +175,7 @@ typedef struct {
     bool reduced;
     jf_body_t body;
     float body_left;
+    float lean_x, lean_y;
 
     /* drawn after precedence */
     uint8_t mood;
@@ -399,8 +402,8 @@ static void jf_resolve(jf_t* f)
 {
     uint8_t mood = f->mood_set;
     jako_face_state_t state = f->state_set;
-    if (f->body == JF_BODY_DIZZY) {
-        mood = M_DIZZY;
+    if (f->body != JF_BODY_NONE) {
+        mood = f->body == JF_BODY_HAPPY ? M_HAPPY : M_DIZZY;
         if (state == JAKO_FACE_STATE_ERROR) state = JAKO_FACE_STATE_IDLE;
     } else if (f->rest && state == JAKO_FACE_STATE_IDLE && mood == M_NEUTRAL) {
         mood = M_SLEEPY;
@@ -422,7 +425,7 @@ static float jf_blink_amount(const jf_t* f)
 /* update() in jako-face.js:111-142, with the device's mouth and timers */
 static void jf_update(jf_t* f, float dt)
 {
-    if (f->body == JF_BODY_DIZZY) {
+    if (f->body != JF_BODY_NONE) {
         f->body_left -= dt;
         if (f->body_left <= JF_TIMER_EPS) {
             f->body = JF_BODY_NONE;
@@ -470,8 +473,10 @@ static void jf_update(jf_t* f, float dt)
     }
     float tx = 0.0f, ty = 0.0f, rate = 12.0f;
     if (f->state == JAKO_FACE_STATE_IDLE && !f->reduced) {
-        tx = f->gtx;
-        ty = f->gty;
+        /* a lean replaces the glance; the glance timers run on underneath */
+        const bool lean = f->lean_x != 0.0f || f->lean_y != 0.0f;
+        tx = lean ? f->lean_x : f->gtx;
+        ty = lean ? f->lean_y : f->gty;
     }
     if (f->state == JAKO_FACE_STATE_THINKING) {
         if (fired && !f->reduced) {
@@ -1034,11 +1039,39 @@ void jako_face_body_event(lv_obj_t* obj, jako_face_body_event_t event)
 {
     jf_t* f = jf_get(obj);
     if (f == NULL) return;
-    if (event == JAKO_FACE_BODY_DIZZY) {
+    switch (event) {
+    case JAKO_FACE_BODY_DIZZY:
         f->body = JF_BODY_DIZZY;
         f->body_left = JF_BODY_DIZZY_S;
         jf_resolve(f);
+        break;
+    case JAKO_FACE_BODY_HAPPY:
+        f->body = JF_BODY_HAPPY;
+        f->body_left = JF_BODY_HAPPY_S;
+        jf_resolve(f);
+        break;
+    case JAKO_FACE_BODY_BLINK:
+        /* the drawn face, after the body and rest layers, as the natural blink */
+        if (f->state != JAKO_FACE_STATE_ERROR && !(MOODS[f->mood].flags & JF_NO_BLINK)) f->blink = JF_BLINK;
+        break;
+    default:
+        break;
     }
+}
+
+void jako_face_set_lean(lv_obj_t* obj, float x, float y)
+{
+    jf_t* f = jf_get(obj);
+    if (f == NULL) return;
+    if (!isfinite(x)) x = 0.0f;
+    if (!isfinite(y)) y = 0.0f;
+    const float len = sqrtf(x * x + y * y);
+    if (len > JF_LEAN_MAX) {
+        x *= JF_LEAN_MAX / len;
+        y *= JF_LEAN_MAX / len;
+    }
+    f->lean_x = x;
+    f->lean_y = y;
 }
 
 /* snap() in jako-face.js:99-106 */
@@ -1111,6 +1144,10 @@ void jako_face_get_debug(lv_obj_t* obj, jako_face_debug_t* out)
     out->mouth_open = f->open;
     out->hearts = jf_hearts(f);
     out->time = f->t;
+    out->body = f->body == JF_BODY_DIZZY ? "dizzy" : f->body == JF_BODY_HAPPY ? "happy" : "none";
+    out->body_left = f->body != JF_BODY_NONE ? f->body_left : 0.0f;
+    out->lean_x = f->lean_x;
+    out->lean_y = f->lean_y;
 }
 
 void jako_face_debug_set_blink(lv_obj_t* obj, float progress)
