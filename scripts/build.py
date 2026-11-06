@@ -488,6 +488,27 @@ _COMMON_CAMERA_CONSTRUCTOR_RE = re.compile(
 )
 
 
+def _ota_url_sdkconfig_option(ota_url: str) -> str:
+    """Map --ota-url to the CONFIG_OTA_URL assignment.
+
+    The address the device calls at boot is deployment configuration, not
+    source: it is given on the command line and never stored in a build entry.
+    """
+    url = ota_url.strip()
+    if not re.fullmatch(r"https?://[A-Za-z0-9.\-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~\-/]*)?", url):
+        raise ValueError(
+            f"--ota-url {ota_url!r} must be an http or https address made of "
+            "letters, digits, dots, dashes and slashes, with no spaces, quotes, "
+            "query or credentials"
+        )
+    if not url.endswith("/"):
+        raise ValueError(
+            f"--ota-url {ota_url!r} must end with a slash: the device treats a "
+            "redirect to the slash form as a failure"
+        )
+    return f'CONFIG_OTA_URL="{url}"'
+
+
 def _sdkconfig_assignments(options: list[str]) -> dict[str, str]:
     """Return the final value for each CONFIG_* assignment in a fragment."""
     assignments: dict[str, str] = {}
@@ -1613,6 +1634,7 @@ def build_board(
     create_zip: bool = False,
     language: Optional[str] = None,
     wake_word: Optional[str] = None,
+    ota_url: Optional[str] = None,
     build_options: Optional[dict[str, object]] = None,
     idf_version: tuple[int, int, int] = (6, 0, 0),
 ) -> None:
@@ -1749,6 +1771,8 @@ def build_board(
             )
         user_options.extend(wake_word_options)
         validation_symbols.append((wake_word_symbols, "--wake-word"))
+        if ota_url is not None:
+            user_options.append(_ota_url_sdkconfig_option(ota_url))
 
         # A build entry may carry semantic defaults to preserve an existing
         # board-specific behavior after it moves out of hardcoded C++.
@@ -1780,6 +1804,8 @@ def build_board(
             print(f"manufacturer: {manufacturer}")
         print(f"language: {selected_language}")
         print(f"wake_word: {selected_wake_word}")
+        if ota_url is not None:
+            print(f"ota_url: {ota_url.strip()}")
         if selected_build_options is not None:
             print(
                 "build_options: "
@@ -1800,6 +1826,8 @@ def build_board(
         for symbols, option_name in validation_symbols:
             _validate_configured_symbols(symbols, option_name)
         _validate_configured_values(wake_word_values, "custom_wake_word")
+        if ota_url is not None:
+            _validate_configured_values([_ota_url_sdkconfig_option(ota_url)], "--ota-url")
         _validate_configured_options(build_option_sdkconfig, "--build-options-json")
 
         # build.name is the compatibility-sensitive OTA-reported board identity.
@@ -1907,6 +1935,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         ),
     )
     parser.add_argument(
+        "--ota-url",
+        metavar="URL",
+        help=(
+            "The address the device calls at boot (CONFIG_OTA_URL), for "
+            "example http://192.168.1.20:8080/xiaozhi/ota/. It must end with "
+            "a slash. Without it the build keeps the Kconfig default"
+        ),
+    )
+    parser.add_argument(
         "--build-options-json",
         metavar="JSON",
         help=(
@@ -1940,6 +1977,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             or args.name
             or args.language
             or args.wake_word
+            or args.ota_url
             or args.build_options_json
             or args.zip
             or args.json
@@ -1959,6 +1997,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             or args.name
             or args.language
             or args.wake_word
+            or args.ota_url
             or args.build_options_json
             or args.zip
         ):
@@ -1980,6 +2019,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             or args.name
             or args.language
             or args.wake_word
+            or args.ota_url
             or args.build_options_json
             or args.zip
         ):
@@ -2008,6 +2048,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             or args.name
             or args.language
             or args.wake_word
+            or args.ota_url
             or args.build_options_json
         ):
             parser.error(
@@ -2087,6 +2128,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             create_zip=args.zip,
             language=args.language,
             wake_word=args.wake_word,
+            ota_url=args.ota_url,
             build_options=parsed_build_options,
             idf_version=idf_version,
         )

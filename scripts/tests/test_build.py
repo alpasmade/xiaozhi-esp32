@@ -17,6 +17,44 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(build)
 
 
+class OtaUrlTests(unittest.TestCase):
+    def test_a_plain_address_becomes_the_kconfig_assignment(self):
+        self.assertEqual(
+            build._ota_url_sdkconfig_option("http://192.168.1.20:8080/xiaozhi/ota/"),
+            'CONFIG_OTA_URL="http://192.168.1.20:8080/xiaozhi/ota/"',
+        )
+        self.assertEqual(
+            build._ota_url_sdkconfig_option("  https://jako.example.com/xiaozhi/ota/ "),
+            'CONFIG_OTA_URL="https://jako.example.com/xiaozhi/ota/"',
+        )
+
+    def test_an_address_without_its_last_slash_is_refused(self):
+        with self.assertRaises(ValueError):
+            build._ota_url_sdkconfig_option("http://192.168.1.20:8080/xiaozhi/ota")
+
+    def test_anything_that_could_break_out_of_the_setting_is_refused(self):
+        for bad in (
+            "",
+            "ftp://host/xiaozhi/ota/",
+            "http://host/xiaozhi/ota/?a=b",
+            'http://host/"/',
+            "http://user:pass@host/xiaozhi/ota/",
+            "http://host/xiaozhi ota/",
+            "http://host/xiaozhi/ota/\nCONFIG_X=y",
+            "host/xiaozhi/ota/",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    build._ota_url_sdkconfig_option(bad)
+
+    def test_the_option_is_refused_with_every_list_mode(self):
+        for mode in ("--list-boards", "--list-languages", "--list-wake-words", "--select-changed"):
+            with self.subTest(mode=mode):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        build.main([mode, "--ota-url", "http://192.168.1.20:8080/xiaozhi/ota/"])
+
+
 class VersionTests(unittest.TestCase):
     def test_parse_and_match(self):
         self.assertEqual(build._parse_version("ESP-IDF v6.0.1"), (6, 0, 1))
@@ -1897,6 +1935,7 @@ class CliTests(unittest.TestCase):
             create_zip=False,
             language=None,
             wake_word=None,
+            ota_url=None,
             build_options=None,
             idf_version=(6, 0, 2),
         )
