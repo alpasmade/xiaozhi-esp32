@@ -8,11 +8,19 @@
    sine table in Q14, block layout in 1/256 px, so the Mac preview and the
    board compute the same pixels. No float anywhere.
 
+   Two styles, picked by each update's "ln" (jako_radar_style_t): the ring
+   (the default), a light of six stepped segments running round the 15 mile
+   ring with marks at the newest update's places, and the line, which turns
+   out to the edge of the radar with its wedge and repaints each plane as it
+   passes. The widget keeps the style it drew; an update of the other style
+   redraws the whole radar once.
+
    Each tick the widget works out what it would draw (jr_geom_t), compares
    it with what it drew last, and invalidates only the parts that changed:
    the line and the wedge as short chains of boxes along each moving edge,
-   a mark only when its record or fade step changes, text only when it
-   changes. The boxes are merged before they reach LVGL, at most
+   the ring's light as one chain of boxes along the ring from its old tail
+   to its new head, a mark only when its record or fade step changes, text
+   only when it changes. The boxes are merged before they reach LVGL, at most
    JAKO_RADAR_INV_MAX a tick, so the face's ring tiles always fit in
    LVGL's 32 slot list. The draw callback only draws; it never
    invalidates, and it skips everything outside the area being drawn.
@@ -20,6 +28,16 @@
    Where the board differs from the mock, on purpose:
    - Wedge edges are whole degrees (LVGL arcs take whole degrees); the line
      itself is at the exact 2.4 degree step and covers the half degree.
+   - The ring's light: its segment edges are whole degrees too, rounded like
+     the wedge's, with no 0.3 degree overlap between segments, and its
+     widths are whole pixels, 2, 2, 3, 3, 4, 4 from the tail (the mock's 2,
+     2, 2.5, 3, 3.5, 4), each centred on the 168 px ring as near as whole
+     pixels allow (the 3 px ones sit half a pixel out).
+   - The line and its wedge end at 191 px (JR_LINE_R), so nothing they
+     light is past 193 px, where the text plates end, and not at 197. On
+     the Mac the two light 192.8 px at most over a turn; a wedge of 192 px
+     lit antialiased pixels just past 193 at some bearings, so the wedge
+     ends with the line. The mock's Edge reach uses the same 191.
    - The grid is a crisp 1 px column or row; the page's canvas spreads it
      over two half-lit pixels.
    - Text is 20 and 22 px (22.4 on the page), whole-pixel advances, no
@@ -53,7 +71,9 @@ LV_FONT_DECLARE(font_inter_600_22_4)
 #define JR_STEP_TENTHS 24
 #define JR_FULL 3600             /* a turn in tenths of a degree */
 #define JR_PX_PER_MI_X10 112     /* PX_PER_MILE 11.2: d (tenths of a mile) x 112 / 100 */
-#define JR_OUTER 168             /* the 15 mile ring, where the line ends */
+#define JR_OUTER 168             /* the 15 mile ring: the crosshair, the grid and the ring's light */
+#define JR_LINE_R 191            /* the line's end; with its round cap and the wedge, lit to 192.8 at most (plates: 193) */
+#define JR_WEDGE_R JR_LINE_R     /* the wedge's outer radius follows the line's end */
 #define JR_RIM 182               /* the rim dot lane */
 #define JR_NORTH_R 188           /* "N" at twelve */
 #define JR_R_IN 15               /* the guides and the line stop short of You */
@@ -80,7 +100,15 @@ LV_FONT_DECLARE(font_inter_600_22_4)
 #define JR_TEXT_FULL 255
 #define JR_BLOCK_GAP 16          /* the focus block's gap from its mark */
 #define JR_BLOCK_PAD 6
-#define JR_CHAIN 4               /* boxes per moving edge */
+#define JR_CHAIN 4               /* boxes per moving edge of the line style (5 and 6 measured no better) */
+#define JR_BAND_LINKS 4          /* boxes along the band the ring's light sweeps in a step */
+#define JR_BAND_IN 164           /* the band the ring's light can light, px */
+#define JR_BAND_OUT 172
+#define JR_RTICK_IN 172          /* the ring style's three cardinal ticks at east, south and west */
+#define JR_RTICK_OUT 180
+#define JR_RTICK_W 2
+#define JR_LIGHT_SEGS 6          /* SWEEP: six segments of 4 degrees, 24 in all, ending at the head */
+#define JR_LIGHT_SEG_TENTHS 40
 #define JR_BOX_CAP 96
 #define JR_TEXT_MAX 40
 #define JR_NONE_MS 0xFFFFFFFFu   /* a record painted quietly, at .62 with no glow */
@@ -97,6 +125,12 @@ static const int32_t JR_GLOW_GROW[2] = {6, 3};                                  
 static const int32_t JR_GLOW_MILLI[2] = {100, 170};
 /* PAINT: [ms after the pass, mark alpha, glow k], then .62 and no glow until the next pass */
 static const int32_t JR_PAINT[3][3] = {{330, 1000, 1000}, {660, 820, 600}, {1000, 700, 300}};
+/* The ring style. PING: [ms after the light passed, glow k], then no glow; the mark stays at .62 throughout.
+   The light from the head back: alphas (the mock's SWEEP.alphas reversed) and whole-pixel widths. */
+static const int32_t JR_PING[3][2] = {{330, 1000}, {660, 600}, {1000, 300}};
+static const int32_t JR_LIGHT_MILLI[JR_LIGHT_SEGS] = {620, 420, 300, 220, 160, 90};
+static const int32_t JR_LIGHT_W[JR_LIGHT_SEGS] = {4, 4, 3, 3, 2, 2};
+_Static_assert(JR_LIGHT_SEGS == JR_SECTORS, "the light's edges share the wedge's edge array");
 /* The loading pulse, T.LOADING .06 to .16 in 8 steps every 2.4 s, in millionths:
    .06 + .10 x (0.5 - 0.5 cos(k x 45 degrees)); reduced motion holds .11 */
 static const int32_t JR_PULSE_MICRO[8] = {60000, 74645, 110000, 145355, 160000, 145355, 110000, 74645};
@@ -166,9 +200,10 @@ typedef struct {
 } jr_block_geom_t;
 
 typedef struct {
+    int32_t style; /* jako_radar_style_t: a change redraws the whole radar */
     int32_t grid_opa, ring_opa, guide_opa, you;
-    int32_t wedge, head;
-    int32_t edge[JR_SECTORS + 1]; /* whole degrees, bearing */
+    int32_t wedge, head; /* wedge: the sweep is shown (the line and its wedge, or the ring's light) */
+    int32_t edge[JR_SECTORS + 1]; /* whole degrees, bearing: the wedge's sectors, or the light's segments */
     lv_point_t line_a, line_b;
     jr_text_geom_t numeral[3];
     jr_text_geom_t north;
@@ -204,6 +239,7 @@ typedef struct {
     uint32_t received_ms;  /* radar clock at the last apply */
     jako_face_state_t face;
     bool reduced;
+    jako_radar_style_t style; /* the style drawn: the last applied update's */
     uint16_t pick;         /* long-press pick, 0 for none */
     uint32_t pick_ms;
 
@@ -213,8 +249,12 @@ typedef struct {
     jako_radar_line_t mode;
     uint32_t last_fix;     /* updates seen by the last tick */
 
-    jr_record_t rec[JAKO_RADAR_MAX_PLANES];
+    jr_record_t rec[JAKO_RADAR_MAX_PLANES]; /* the line style's records */
     uint8_t rec_n;
+    /* the ring style: when the light last passed each listed plane, while its glow lasts */
+    uint16_t ping_id[JAKO_RADAR_MAX_PLANES];
+    uint32_t ping_at[JAKO_RADAR_MAX_PLANES];
+    uint8_t ping_n;
     jr_record_t snap[JAKO_RADAR_MAX_PLANES]; /* scratch: the marks while the line does not turn */
     uint16_t side_id;      /* the side the focus block took last tick, tried first */
     int32_t side_ux, side_uy;
@@ -229,6 +269,7 @@ typedef struct {
     /* the guides never move: worked out once */
     lv_point_t tick_a[35], tick_b[35];
     int32_t tick_w[35];
+    lv_point_t rtick_a[3], rtick_b[3];
     lv_point_t cross_a[4], cross_b[4];
     lv_area_t grid[JR_GRID_LINES * 4];
     int32_t cx, cy;
@@ -535,7 +576,47 @@ static bool jr_passed(int32_t a, int32_t b, int32_t brg)
     return d > 0 && d < 1800 && e > 0 && e <= d;
 }
 
-/* The line and the records, frame() in scope.js up to the marks. Returns the committed head. */
+/* The ring style's passes: the light lights a plane's glow as its committed head passes the plane's
+   bearing while it turns. Its first frame, a catch-up after a hold and a gap light nothing, as the line
+   repaints quietly then. A ping lasts as long as its glow, or until its plane is no longer listed. */
+static void jr_pings(jr_t* r, jako_radar_line_t next, int32_t before, int32_t head, bool gap)
+{
+    if (next == JAKO_RADAR_LINE_STOPPED) {
+        r->ping_n = 0;
+        return;
+    }
+    uint8_t k = 0;
+    for (uint8_t i = 0; i < r->ping_n; i++)
+        if (r->clock - r->ping_at[i] < (uint32_t)JR_PING[2][0] && jr_find_plane(r, r->ping_id[i]) >= 0) {
+            r->ping_id[k] = r->ping_id[i];
+            r->ping_at[k] = r->ping_at[i];
+            k++;
+        }
+    r->ping_n = k;
+    if (next != JAKO_RADAR_LINE_MOVING || r->mode != JAKO_RADAR_LINE_MOVING || gap) return;
+    for (uint8_t i = 0; i < r->u.plane_n; i++) {
+        const jako_radar_plane_t* p = &r->u.planes[i];
+        if (!jr_passed(before, head, p->b * 10)) continue;
+        uint8_t at = 0;
+        while (at < r->ping_n && r->ping_id[at] != p->id) at++;
+        if (at == r->ping_n) {
+            if (r->ping_n >= JAKO_RADAR_MAX_PLANES) continue;
+            r->ping_n++;
+        }
+        r->ping_id[at] = p->id;
+        r->ping_at[at] = r->clock;
+    }
+}
+
+static uint32_t jr_ping_at(const jr_t* r, uint16_t id)
+{
+    for (uint8_t i = 0; i < r->ping_n; i++)
+        if (r->ping_id[i] == id) return r->ping_at[i];
+    return JR_NONE_MS;
+}
+
+/* The sweep, frame() in scope.js up to the marks: the line and its records, or the ring's light and its
+   passes. Returns the committed head. */
 static int32_t jr_sweep(jr_t* r, bool gap)
 {
     const bool turns = r->view == JAKO_RADAR_VIEW_LIVE || r->view == JAKO_RADAR_VIEW_EMPTY ||
@@ -552,7 +633,12 @@ static int32_t jr_sweep(jr_t* r, bool gap)
     const int32_t head = r->angle_ms * JR_STEPS / JR_TURN_MS * JR_STEP_TENTHS;
     const bool new_fix = r->updates != r->last_fix;
 
-    if (next != JAKO_RADAR_LINE_STOPPED) {
+    if (r->style == JAKO_RADAR_STYLE_RING) {
+        /* the marks come from the newest update; only the passes are kept */
+        jr_pings(r, next, before, head, gap);
+        r->rec_n = 0;
+    } else if (next != JAKO_RADAR_LINE_STOPPED) {
+        r->ping_n = 0;
         const bool repaint = r->mode == JAKO_RADAR_LINE_STOPPED ||
                              (next == JAKO_RADAR_LINE_MOVING && r->mode == JAKO_RADAR_LINE_HELD) || gap ||
                              (next == JAKO_RADAR_LINE_HELD && new_fix);
@@ -574,6 +660,7 @@ static int32_t jr_sweep(jr_t* r, bool gap)
         }
     } else {
         r->rec_n = 0;
+        r->ping_n = 0;
     }
     r->mode = next;
     r->last_fix = r->updates;
@@ -720,13 +807,22 @@ static lv_area_t jr_q_area(const jr_rect_t* q)
 
 /* ------------------------------------------------------------- geometry */
 
-/* opacity of a plane mark and its glow k (thousandths) now: stepped down from the pass, then .62 */
+/* opacity of a plane mark and its glow k (thousandths) now. The line: stepped down from the pass, then .62.
+   The ring: always .62, with the glow stepped down from the light's pass. */
 static void jr_fade(const jr_t* r, const jr_record_t* e, int32_t* a, int32_t* k)
 {
     *a = JR_SOFT_MILLI;
     *k = 0;
     if (e->at == JR_NONE_MS) return;
     const uint32_t since = r->clock - e->at;
+    if (r->style == JAKO_RADAR_STYLE_RING) {
+        for (int i = 0; i < 3; i++)
+            if (since < (uint32_t)JR_PING[i][0]) {
+                *k = JR_PING[i][1];
+                return;
+            }
+        return;
+    }
     for (int i = 0; i < 3; i++)
         if (since < (uint32_t)JR_PAINT[i][0]) {
             *a = JR_PAINT[i][1];
@@ -892,6 +988,7 @@ static void jr_status_geom(const jr_t* r, jr_text_geom_t* t, const char* s, int3
 static void jr_compute(jr_t* r, jr_geom_t* g, int32_t head)
 {
     memset(g, 0, sizeof(*g));
+    g->style = r->style;
     for (int i = 0; i < 3; i++) jr_area_empty(&g->numeral[i].bounds);
     jr_area_empty(&g->north.bounds);
     jr_area_empty(&g->status.bounds);
@@ -910,22 +1007,26 @@ static void jr_compute(jr_t* r, jr_geom_t* g, int32_t head)
     g->grid_opa = jr_rdiv(gmicro * 255 * JR_GRID_MILLI * stale, (int64_t)JR_GUIDE_MILLI * 1000000000LL);
     g->you = pos_stale ? JR_YOU_DASHES : JR_YOU_RING;
 
-    /* the wedge and the line */
+    /* the sweep: the wedge and the line, or the ring's light */
     g->wedge = r->mode != JAKO_RADAR_LINE_STOPPED;
     if (g->wedge) {
+        const int32_t span = r->style == JAKO_RADAR_STYLE_RING ? JR_LIGHT_SEG_TENTHS : JR_SECTOR_TENTHS;
         g->head = head;
-        for (int k = 0; k <= JR_SECTORS; k++) g->edge[k] = jr_rdiv(head - k * JR_SECTOR_TENTHS, 10);
-        g->line_a = jr_polar(r->cx, r->cy, head, JR_R_IN * 16);
-        g->line_b = jr_polar(r->cx, r->cy, head, JR_OUTER * 16);
+        for (int k = 0; k <= JR_SECTORS; k++) g->edge[k] = jr_rdiv(head - k * span, 10);
+        if (r->style == JAKO_RADAR_STYLE_LINE) {
+            g->line_a = jr_polar(r->cx, r->cy, head, JR_R_IN * 16);
+            g->line_b = jr_polar(r->cx, r->cy, head, JR_LINE_R * 16);
+        }
     }
 
-    /* the marks: from the line's records, or, while the line does not turn, from the data */
+    /* the marks: from the line's records, or from the newest update in the ring style and while the line
+       does not turn (the ring style with the light's passes) */
     jr_record_t* snap = r->snap;
     const jr_record_t* recs[JAKO_RADAR_MAX_PLANES];
     int32_t rn = 0;
     for (uint8_t i = 0; i < r->u.plane_n; i++) {
-        if (r->mode == JAKO_RADAR_LINE_STOPPED) {
-            jr_record(r, &r->u.planes[i], JR_NONE_MS, &snap[rn]);
+        if (r->style == JAKO_RADAR_STYLE_RING || r->mode == JAKO_RADAR_LINE_STOPPED) {
+            jr_record(r, &r->u.planes[i], jr_ping_at(r, r->u.planes[i].id), &snap[rn]);
             recs[rn] = &snap[rn];
             rn++;
         } else {
@@ -1078,6 +1179,23 @@ static void jr_chain(jr_t* r, int32_t a0, int32_t a1, int32_t r0, int32_t r1, in
     }
 }
 
+/* The band the ring's light sweeps from bearing a0 to a1 (tenths, clockwise), r0 to r1 px, as a chain of
+   boxes along it: each link spans a few degrees, so its box hugs the curve. */
+static void jr_band(jr_t* r, int32_t a0, int32_t a1, int32_t r0, int32_t r1, int32_t margin)
+{
+    const int32_t span = jr_norm(a1 - a0);
+    for (int32_t j = 0; j < JR_BAND_LINKS; j++) {
+        const int32_t b0 = a0 + span * j / JR_BAND_LINKS, b1 = a0 + span * (j + 1) / JR_BAND_LINKS;
+        lv_area_t box;
+        jr_area_empty(&box);
+        const lv_point_t pts[5] = {jr_polar(r->cx, r->cy, b0, r0 * 16), jr_polar(r->cx, r->cy, b0, r1 * 16),
+                                   jr_polar(r->cx, r->cy, b1, r0 * 16), jr_polar(r->cx, r->cy, b1, r1 * 16),
+                                   jr_polar(r->cx, r->cy, (b0 + b1) / 2, r1 * 16)};
+        for (int i = 0; i < 5; i++) jr_area_point(&box, pts[i], margin);
+        jr_box(&r->boxes, &box);
+    }
+}
+
 static void jr_disc_box(jr_t* r)
 {
     lv_area_t a = {r->cx - JR_CONTENT_R - 2, r->cy - JR_CONTENT_R - 2, r->cx + JR_CONTENT_R + 2,
@@ -1094,12 +1212,22 @@ static void jr_diff_text(jr_t* r, const jr_text_geom_t* o, const jr_text_geom_t*
 
 static void jr_invalidate_changes(jr_t* r, const jr_geom_t* o, const jr_geom_t* n)
 {
-    if (o->grid_opa != n->grid_opa || o->ring_opa != n->ring_opa || o->guide_opa != n->guide_opa || o->you != n->you ||
-        o->wedge != n->wedge) {
+    if (o->style != n->style || o->grid_opa != n->grid_opa || o->ring_opa != n->ring_opa ||
+        o->guide_opa != n->guide_opa || o->you != n->you || o->wedge != n->wedge) {
         jr_disc_box(r);
         return;
     }
-    if (n->wedge && o->head != n->head) {
+    if (n->wedge && o->head != n->head && n->style == JAKO_RADAR_STYLE_RING) {
+        /* every segment of the light changes when the head steps: one band from the old tail to the new head,
+           a degree wider each side for the whole-degree edges. After a hold the light catches up in one
+           step: then the old light and the new one, each its own band. */
+        if (jr_norm(n->head - o->head) <= 150) {
+            jr_band(r, o->edge[JR_LIGHT_SEGS] * 10 - 10, n->edge[0] * 10 + 10, JR_BAND_IN, JR_BAND_OUT, 2);
+        } else {
+            jr_band(r, o->edge[JR_LIGHT_SEGS] * 10 - 10, o->edge[0] * 10 + 10, JR_BAND_IN, JR_BAND_OUT, 2);
+            jr_band(r, n->edge[JR_LIGHT_SEGS] * 10 - 10, n->edge[0] * 10 + 10, JR_BAND_IN, JR_BAND_OUT, 2);
+        }
+    } else if (n->wedge && o->head != n->head) {
         if (jr_norm(n->head - o->head) > 150) {
             jr_disc_box(r); /* a jump after a hold or a stall: rare */
             return;
@@ -1108,7 +1236,7 @@ static void jr_invalidate_changes(jr_t* r, const jr_geom_t* o, const jr_geom_t* 
            one, and the leading edge also covers the line at its exact steps (within half a degree of it) */
         for (int k = 0; k <= JR_SECTORS; k++) {
             const int32_t a = k == 0 ? o->head - 5 : o->edge[k] * 10, b = k == 0 ? n->head + 5 : n->edge[k] * 10;
-            jr_chain(r, a - 5, b + 5, JR_R_IN - 3, JR_OUTER + 3, 3);
+            jr_chain(r, a - 5, b + 5, JR_R_IN - 3, JR_WEDGE_R + 3, 3);
         }
     }
     for (int i = 0; i < 3; i++) jr_diff_text(r, &o->numeral[i], &n->numeral[i]);
@@ -1392,15 +1520,39 @@ static void jr_draw_cb(lv_event_t* e)
     const jr_geom_t* g = &r->geom;
     const lv_color_t light = lv_color_hex(JAKO_RADAR_LIGHT);
 
-    /* the guides: grid, rings, crosshair, ticks */
-    for (int i = 0; i < JR_GRID_LINES * 4; i++) jr_fill(layer, obj, &r->grid[i], 0, light, g->grid_opa);
+    /* the guides: the line style's grid, the rings, then the line style's crosshair and ticks or the ring
+       style's three cardinal ticks */
+    const bool line = g->style == JAKO_RADAR_STYLE_LINE;
+    if (line)
+        for (int i = 0; i < JR_GRID_LINES * 4; i++) jr_fill(layer, obj, &r->grid[i], 0, light, g->grid_opa);
     for (int i = 1; i <= 3; i++)
         jr_arc(layer, obj, r->cx, r->cy, i * 56 + JR_RING_W / 2, JR_RING_W, 0, 360, false, g->ring_opa);
-    for (int i = 0; i < 4; i++) jr_line(layer, obj, r->cross_a[i], r->cross_b[i], JR_CROSS_W, g->guide_opa);
-    for (int i = 0; i < 35; i++) jr_line(layer, obj, r->tick_a[i], r->tick_b[i], r->tick_w[i], g->guide_opa);
+    if (line) {
+        for (int i = 0; i < 4; i++) jr_line(layer, obj, r->cross_a[i], r->cross_b[i], JR_CROSS_W, g->guide_opa);
+        for (int i = 0; i < 35; i++) jr_line(layer, obj, r->tick_a[i], r->tick_b[i], r->tick_w[i], g->guide_opa);
+    } else {
+        for (int i = 0; i < 3; i++) jr_line(layer, obj, r->rtick_a[i], r->rtick_b[i], JR_RTICK_W, g->guide_opa);
+    }
+
+    /* the ring's light, tail to head: stepped segments on the 15 mile ring, each centred on it */
+    if (g->wedge && !line) {
+        for (int k = JR_LIGHT_SEGS - 1; k >= 0; k--) {
+            const int32_t w = JR_LIGHT_W[k], outer = JR_OUTER + (w + 1) / 2;
+            lv_area_t box;
+            jr_area_empty(&box);
+            const int32_t t[3] = {g->edge[k + 1] * 10, (g->edge[k + 1] + g->edge[k]) * 5, g->edge[k] * 10};
+            for (int i = 0; i < 3; i++) {
+                jr_area_point(&box, jr_polar(r->cx, r->cy, t[i], (outer - w) * 16), 3);
+                jr_area_point(&box, jr_polar(r->cx, r->cy, t[i], outer * 16), 3);
+            }
+            if (!jr_visible(layer, &box)) continue;
+            jr_arc(layer, obj, r->cx, r->cy, outer, w, jr_lv_angle(g->edge[k + 1]), jr_lv_angle(g->edge[k]), false,
+                   jr_opa(JR_LIGHT_MILLI[k]));
+        }
+    }
 
     /* the wedge, dim to bright, then the line: stepped sectors, never a gradient */
-    if (g->wedge) {
+    if (g->wedge && line) {
         for (int i = JR_SECTORS - 1; i >= 0; i--) {
             /* LVGL masks every row of the whole circle's box for an arc, so a sector the area being drawn
                cannot reach is skipped: its box is its corners and middle, inner and outer, plus 3 px */
@@ -1409,10 +1561,10 @@ static void jr_draw_cb(lv_event_t* e)
             const int32_t t[3] = {g->edge[i + 1] * 10, (g->edge[i + 1] + g->edge[i]) * 5, g->edge[i] * 10};
             for (int k = 0; k < 3; k++) {
                 jr_area_point(&box, jr_polar(r->cx, r->cy, t[k], JR_R_IN * 16), 3);
-                jr_area_point(&box, jr_polar(r->cx, r->cy, t[k], JR_OUTER * 16), 3);
+                jr_area_point(&box, jr_polar(r->cx, r->cy, t[k], JR_WEDGE_R * 16), 3);
             }
             if (!jr_visible(layer, &box)) continue;
-            jr_arc(layer, obj, r->cx, r->cy, JR_OUTER, JR_OUTER - JR_R_IN, jr_lv_angle(g->edge[i + 1]),
+            jr_arc(layer, obj, r->cx, r->cy, JR_WEDGE_R, JR_WEDGE_R - JR_R_IN, jr_lv_angle(g->edge[i + 1]),
                    jr_lv_angle(g->edge[i]), false, jr_opa(JR_WEDGE_MILLI[i]));
         }
         jr_line(layer, obj, g->line_a, g->line_b, JR_LINE_W, LV_OPA_COVER);
@@ -1469,6 +1621,11 @@ static void jr_setup_guides(jr_t* r)
         r->tick_a[n] = jr_polar(r->cx, r->cy, b * 10, (cardinal ? 190 : 191) * 16);
         r->tick_b[n] = jr_polar(r->cx, r->cy, b * 10, 195 * 16);
         r->tick_w[n] = cardinal ? 3 : 2;
+    }
+    /* the ring style: east, south and west, 172 to 180 px, round-capped (N stands at twelve) */
+    for (int i = 0; i < 3; i++) {
+        r->rtick_a[i] = jr_polar(r->cx, r->cy, (i + 1) * 900, JR_RTICK_IN * 16);
+        r->rtick_b[i] = jr_polar(r->cx, r->cy, (i + 1) * 900, JR_RTICK_OUT * 16);
     }
     for (int i = 0; i < 4; i++) {
         r->cross_a[i] = jr_polar(r->cx, r->cy, i * 900, JR_R_IN * 16);
@@ -1531,6 +1688,8 @@ lv_obj_t* jako_radar_create(lv_obj_t* parent)
     r->mode = JAKO_RADAR_LINE_STOPPED;
     r->u.state = JAKO_RADAR_STATE_LOADING;
     r->u.src = JAKO_RADAR_SRC_FEED;
+    r->u.style = JAKO_RADAR_STYLE_RING;
+    r->style = JAKO_RADAR_STYLE_RING;
     lv_obj_update_layout(obj);
     jr_setup_guides(r);
     lv_obj_set_user_data(obj, r);
@@ -1550,7 +1709,16 @@ uint16_t jako_radar_apply(lv_obj_t* obj, const jako_radar_update_t* u)
     r->u = *u;
     if (r->u.plane_n > JAKO_RADAR_MAX_PLANES) r->u.plane_n = JAKO_RADAR_MAX_PLANES;
     if (r->u.state != JAKO_RADAR_STATE_LIVE) r->u.plane_n = 0;
+    if (r->u.style != JAKO_RADAR_STYLE_LINE) r->u.style = JAKO_RADAR_STYLE_RING;
     if (r->u.focus != old_f) r->pick = 0; /* any change of f clears the local pick */
+    if (r->u.style != r->style) {
+        /* the other style: every mark quiet at .62, no pass remembered, and the whole radar redrawn once */
+        r->style = r->u.style;
+        jr_repaint_all(r);
+        r->ping_n = 0;
+        jr_disc_box(r);
+        JR_LOGI("style %s", r->style == JAKO_RADAR_STYLE_LINE ? "line" : "ring");
+    }
     r->received_ms = r->clock;
     r->updates++;
     r->expired = false;
@@ -1625,6 +1793,7 @@ void jako_radar_get_debug(lv_obj_t* obj, jako_radar_debug_t* out)
     out->updates = r->updates;
     out->state = r->u.state;
     out->src = r->u.src;
+    out->style = r->style;
     out->view = r->view;
     out->flights_age_s = r->flights_age_s;
     out->position_age_s = r->position_age_s;
@@ -1645,8 +1814,15 @@ void jako_radar_get_debug(lv_obj_t* obj, jako_radar_debug_t* out)
         d->in_range = m->kind != JR_MK_RIM;
         d->focus = m->focus != 0;
         d->painted_ms = JR_NONE_MS;
+        if (r->style == JAKO_RADAR_STYLE_RING) d->painted_ms = jr_ping_at(r, (uint16_t)m->id);
         for (uint8_t k = 0; k < r->rec_n; k++)
             if (r->rec[k].id == m->id) d->painted_ms = r->rec[k].at;
+        jr_record_t e;
+        memset(&e, 0, sizeof(e));
+        e.at = d->painted_ms;
+        int32_t a, k;
+        jr_fade(r, &e, &a, &k);
+        d->glow_k = (uint16_t)k;
     }
     out->status = r->status;
     out->status_opa = (uint8_t)(g->status.shown ? g->status.opa : 0);

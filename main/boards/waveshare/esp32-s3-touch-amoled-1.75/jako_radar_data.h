@@ -10,7 +10,10 @@
    Data that is not JSON (text after the object included), is nested
    deeper than the contract's shape, or lacks v, seq or state is refused,
    and so is any v other than 1, a seq below 1 and a src that is not "feed"
-   or "sample"; a refusal leaves the caller's last good update untouched. */
+   or "sample"; a refusal leaves the caller's last good update untouched.
+   The optional "ln" picks the style: a number equal to 1 is the line, and
+   anything else (absent, 0, true, "1", null) is the ring; it is never a
+   refusal. */
 #ifndef JAKO_RADAR_DATA_H
 #define JAKO_RADAR_DATA_H
 
@@ -42,6 +45,12 @@ typedef enum {
     JAKO_RADAR_SRC_SAMPLE, /* invented flights: the screen says "Sample sky" */
 } jako_radar_src_t;
 
+/* How the scope sweeps, from the update's "ln". */
+typedef enum {
+    JAKO_RADAR_STYLE_RING = 0, /* the default: a light runs round the 15 mile ring */
+    JAKO_RADAR_STYLE_LINE,     /* "ln":1, the sweeping line with its wedge, the data clock */
+} jako_radar_style_t;
+
 typedef struct {
     int16_t b; /* 0..359, degrees from You, clockwise from north */
     int16_t d; /* 0..999, tenths of a statute mile */
@@ -66,6 +75,7 @@ typedef struct {
     int32_t age;     /* 0..3600 s since the flights were fetched, at send time */
     int32_t pos_age; /* 0..86400 s since the phone's fix, at send time */
     uint16_t focus;  /* f: the server's focus id, 0 for none */
+    jako_radar_style_t style; /* ln: the line only when it is a number equal to 1 */
     uint8_t plane_n; /* 0 unless state is live */
     jako_radar_plane_t planes[JAKO_RADAR_MAX_PLANES];
 } jako_radar_update_t;

@@ -1,11 +1,18 @@
 // Copyright 2026 Alpas Made. All rights reserved.
 /* The flight radar for LVGL 9.5: the Scope, a port of
    mockup/radar-concepts/scope.js and the parts of shared.js it draws with.
-   You at the centre, north fixed at twelve, rings at 5, 10 and 15 miles, a
-   crosshair, a faint square grid, ticks round the rim, and a line that
-   turns clockwise once every 5 s with a 45 degree wedge of afterglow. As
-   the line passes a plane it paints the plane's mark where the plane is
-   now; the mark steps down to .62 and stays there until the next pass.
+   You at the centre, north fixed at twelve, rings at 5, 10 and 15 miles,
+   and a sweep that turns clockwise once every 5 s, in one of two styles
+   picked by each update (jako_radar_style_t):
+   - the ring (the default): three short ticks at east, south and west and
+     a light of six stepped segments running round the 15 mile ring. Marks
+     sit where the newest update puts them, at .62, and glow as the light
+     passes their bearing.
+   - the line: a crosshair, a faint square grid, ticks round the rim, and a
+     line out to the edge of the radar with a 45 degree wedge of afterglow.
+     As the line passes a plane it paints the plane's mark where the plane
+     is now; the mark steps down to .62 and stays there until the next pass.
+   A change of style redraws the whole radar once.
 
    Built like jako_face: one transparent full-size LVGL object that draws
    itself in LV_EVENT_DRAW_MAIN and runs its own 33 ms timer. Each tick it
@@ -40,7 +47,7 @@ extern "C" {
 #define JAKO_RADAR_INV_MAX 12         /* areas invalidated per tick, at most (LVGL keeps 32 for the whole screen) */
 #define JAKO_RADAR_CONTENT_R 197      /* px from the centre: nothing is lit beyond */
 
-/* What the line is doing. */
+/* What the sweep is doing: the line, or in the ring style the ring's light. */
 typedef enum {
     JAKO_RADAR_LINE_STOPPED = 0, /* not shown: loading, error, flights old, reduced motion */
     JAKO_RADAR_LINE_MOVING,
@@ -65,7 +72,9 @@ typedef struct {
     uint8_t opa;       /* the mark's opacity now, after the flights-old dim */
     bool in_range;     /* false: a dot on the rim */
     bool focus;
-    uint32_t painted_ms; /* radar clock when the line last painted it, or UINT32_MAX for a quiet repaint */
+    uint32_t painted_ms; /* radar clock when the sweep last passed it (the line painted it, or the ring's
+                            light lit its glow), or UINT32_MAX for none */
+    uint16_t glow_k;     /* the pass glow now, thousandths: 1000, 600, 300 in the second after a pass, else 0 */
 } jako_radar_mark_debug_t;
 
 /* For the preview's checks and for logs. */
@@ -75,10 +84,12 @@ typedef struct {
     uint32_t updates;             /* applied */
     jako_radar_state_t state;     /* the last update's */
     jako_radar_src_t src;
+    jako_radar_style_t style;     /* the style drawn: the last applied update's */
     jako_radar_view_t view;
     int32_t flights_age_s, position_age_s;
     jako_radar_line_t line;
-    int32_t head_tenths;          /* the line's bearing, tenths of a degree, committed in 2.4 degree steps */
+    int32_t head_tenths;          /* the sweep's head (the line, or the light on the ring), tenths of a degree,
+                                     committed in 2.4 degree steps */
     uint16_t focus_id;            /* shown */
     uint16_t server_focus;        /* the last update's f */
     uint16_t pick_id;             /* the long-press pick, 0 for none */
@@ -107,8 +118,9 @@ typedef void (*jako_radar_expire_cb_t)(lv_obj_t* radar, void* user);
 lv_obj_t* jako_radar_create(lv_obj_t* parent);
 
 /* Show a parsed update. The caller has already gated it with
-   jako_radar_seq_admit. Ages start counting from now. Returns the plane id
-   in focus on screen afterwards, 0 for none. */
+   jako_radar_seq_admit. Ages start counting from now. An update of the
+   other style redraws the whole radar once in its style. Returns the plane
+   id in focus on screen afterwards, 0 for none. */
 uint16_t jako_radar_apply(lv_obj_t* radar, const jako_radar_update_t* update);
 
 /* The long press: focus the entry after the shown focus, in list order,
@@ -121,10 +133,10 @@ uint16_t jako_radar_next(lv_obj_t* radar);
    that the seq gate dropped. */
 uint16_t jako_radar_focus(lv_obj_t* radar);
 
-/* The face's state as drawn: the line holds while it is thinking. */
+/* The face's state as drawn: the sweep holds while it is thinking. */
 void jako_radar_set_face_state(lv_obj_t* radar, jako_face_state_t state);
 
-/* No line and no wedge; the loading pulse holds at its middle. */
+/* No sweep (no line and wedge, no light on the ring); the loading pulse holds at its middle. */
 void jako_radar_set_reduced_motion(lv_obj_t* radar, bool on);
 
 void jako_radar_set_expire_cb(lv_obj_t* radar, jako_radar_expire_cb_t cb, void* user);

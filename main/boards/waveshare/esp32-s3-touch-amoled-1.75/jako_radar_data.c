@@ -198,6 +198,9 @@ jako_radar_parse_result_t jako_radar_parse(const char* data, size_t len, jako_ra
     out->age = jrd_int_or(root, "age", 0, 0, JRD_AGE_MAX);
     out->pos_age = jrd_int_or(root, "pos_age", 0, 0, JRD_POS_AGE_MAX);
     out->focus = (uint16_t)jrd_int_or(root, "f", 0, 0, JRD_ID_MAX);
+    /* ln: exactly the number 1 (1, 1.0, 1e0) is the line; anything else, true and "1" included, is the ring */
+    const cJSON* ln = cJSON_GetObjectItemCaseSensitive(root, "ln");
+    out->style = (cJSON_IsNumber(ln) && ln->valuedouble == 1.0) ? JAKO_RADAR_STYLE_LINE : JAKO_RADAR_STYLE_RING;
     if (state == JAKO_RADAR_STATE_LIVE) {
         out->plane_n = jrd_planes(root, out->planes);
         /* live always carries a plane; live with none listed reads as a clear sky */
