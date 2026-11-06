@@ -199,6 +199,8 @@ typedef struct {
     uint32_t ring_commits;
     float ring_commit_time;
 
+    jako_face_show_t show;
+
     jf_geom_state_t geom_state;
     jf_geom_t geom, next;
 } jf_t;
@@ -714,10 +716,14 @@ static void jf_compute(const jf_t* f, jf_geom_t* g)
     const float u = (float)w / JF_UNITS, x0 = (float)c.x1, y0 = (float)c.y1;
     g->g04 = jf_round(0.4f * u);
     g->g08 = jf_round(0.8f * u);
-    const float blink = jf_blink_amount(f);
-    const bool hearts = jf_hearts(f);
-    for (int i = 0; i < 2; i++) jf_eye_geom(f, g, i, u, x0, y0, blink, hearts);
-    jf_mouth_geom(f, g, u, x0, y0);
+    /* ring only: the eyes and mouth stay empty (kind none, empty bounds), so
+       their old areas are invalidated once and nothing draws there after */
+    if (f->show != JAKO_FACE_SHOW_RING_ONLY) {
+        const float blink = jf_blink_amount(f);
+        const bool hearts = jf_hearts(f);
+        for (int i = 0; i < 2; i++) jf_eye_geom(f, g, i, u, x0, y0, blink, hearts);
+        jf_mouth_geom(f, g, u, x0, y0);
+    }
     jf_ring_geom(f, g, u, x0, y0);
 }
 
@@ -1021,6 +1027,19 @@ void jako_face_set_mouth_level(lv_obj_t* obj, float level01)
     f->open_target = 0.15f + 0.85f * jf_clampf(level01, 0.0f, 1.0f);
 }
 
+void jako_face_set_show(lv_obj_t* obj, jako_face_show_t show)
+{
+    jf_t* f = jf_get(obj);
+    if (f == NULL) return;
+    if (show != JAKO_FACE_SHOW_RING_ONLY) show = JAKO_FACE_SHOW_FULL;
+    if (show == f->show) return;
+    const jako_face_show_t was = f->show;
+    f->show = show;
+    if (f->geom_state != JF_GEOM_READY) return;
+    jf_refresh_geom(f);
+    if (was == JAKO_FACE_SHOW_RING_ONLY) lv_obj_invalidate(f->obj);
+}
+
 void jako_face_set_reduced_motion(lv_obj_t* obj, bool on)
 {
     jf_t* f = jf_get(obj);
@@ -1148,6 +1167,7 @@ void jako_face_get_debug(lv_obj_t* obj, jako_face_debug_t* out)
     out->body_left = f->body != JF_BODY_NONE ? f->body_left : 0.0f;
     out->lean_x = f->lean_x;
     out->lean_y = f->lean_y;
+    out->show = f->show;
 }
 
 void jako_face_debug_set_blink(lv_obj_t* obj, float progress)

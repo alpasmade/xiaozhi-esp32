@@ -19,6 +19,7 @@
 #include "esp_io_expander_tca9554.h"
 #include "settings.h"
 
+#include <esp_heap_caps.h>
 #include <esp_lcd_touch_cst9217.h>
 #include <esp_lvgl_port.h>
 #include <esp_random.h>
@@ -29,10 +30,13 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <expected>
+#include <string>
 
 #include "jako_body.h"
 #include "jako_face.h"
 #include "jako_motion.h"
+#include "jako_radar.h"
 
 #define TAG "WaveshareEsp32s3TouchAMOLED1inch75"
 
@@ -148,6 +152,7 @@ public:
             // popup and a preview image still draw on top of the face.
             lv_obj_move_to_index(face_, 1);
             jako_face_set_seed(face_, esp_random());
+            jako_face_set_reduced_motion(face_, kReducedMotion);
             jako_face_set_pre_tick(face_, PreTick, this);
             for (lv_obj_t* obj : {emoji_box_, top_bar_, status_bar_}) {
                 if (obj != nullptr) {
@@ -194,6 +199,13 @@ public:
         }
         if (state == kDeviceStateFatalError) {
             layer_ = FaceLayer::kError;
+        }
+        // The radar rides on the conversation: any other state (the socket
+        // closed, an error, idle) closes it, and the next socket's ids
+        // start again at 1.
+        if (!InConversation(state)) {
+            CloseRadar("the conversation ended");
+            jako_radar_seq_reset(&radar_gate_);
         }
         Apply();
     }
@@ -265,9 +277,66 @@ public:
         level_ms_.store((uint32_t)(esp_timer_get_time() / 1000), std::memory_order_release);
     }
 
+    // The flight radar (docs/radar.md, wire contract v1). The tools parse on
+    // the main task and hand a checked update here; the rest runs under the
+    // display lock, which also guards the seq gate, so the state change and
+    // the 60 s close agree with the tools.
+
+    // Draws an update: opens the radar on the first one the gate admits.
+    // Returns the plane id in focus on screen, 0 for none, or the refusal.
+    std::expected<int, std::string> RadarUpdate(const jako_radar_update_t& update) {
+        DisplayLockGuard lock(this);
+        if (face_ == nullptr) {
+            return std::unexpected(std::string("radar: no face on this screen"));
+        }
+        if (!InConversation(device_state_)) {
+            return std::unexpected(std::string("radar: not in a conversation"));
+        }
+        if (!jako_radar_seq_admit(&radar_gate_, update.seq)) {
+            // A retry or a late update: not drawn, the focus on screen is the answer.
+            return radar_ != nullptr ? (int)jako_radar_focus(radar_) : 0;
+        }
+        if (radar_ == nullptr && !OpenRadar()) {
+            return std::unexpected(std::string("radar: no memory"));
+        }
+        // "No flight data": the face shows error for 2.4 s, as the mock does.
+        if (update.state == JAKO_RADAR_STATE_ERROR && radar_drawn_ != JAKO_RADAR_STATE_ERROR) {
+            radar_error_ = RadarErrorFace::kShowing;
+            radar_error_since_ms_ = NowMs();
+            Apply();
+        }
+        radar_drawn_ = update.state;
+        const int focus = (int)jako_radar_apply(radar_, &update);
+        LogRadarHeap();
+        return focus;
+    }
+
+    // The close tool. Outside a conversation the gate was already reset; a
+    // close that arrives late must not raise it for the next socket.
+    void RadarClose(int seq) {
+        DisplayLockGuard lock(this);
+        if (InConversation(device_state_)) {
+            jako_radar_seq_close(&radar_gate_, seq);
+        }
+        CloseRadar("the close tool");
+    }
+
+    // The long press: the next plane, only while the radar is open.
+    void RadarNext() {
+        DisplayLockGuard lock(this);
+        if (radar_ == nullptr) {
+            return;
+        }
+        [[maybe_unused]] const uint16_t focus = jako_radar_next(radar_);  // outside the log: it may compile out
+        ESP_LOGI(TAG, "Radar: long press, focus %u", (unsigned)focus);
+    }
+
 private:
     // What sits on top of the device state. Named states, not flags.
     enum class FaceLayer { kNone, kThinking, kError };
+    // The radar's error face: shown for kRadarErrorFaceMs when an update
+    // turns to "No flight data", above thinking, under a latched error.
+    enum class RadarErrorFace { kOff, kShowing };
 
     // A level older than this means playback has paused: the mouth closes.
     static constexpr uint32_t kLevelTimeoutMs = 100;
@@ -277,6 +346,19 @@ private:
     // dBFS that maps to a closed and a fully open mouth. Tune on the board.
     static constexpr float kLevelFloorDb = -45.0f;
     static constexpr float kLevelRangeDb = 35.0f;
+    // The face's reduced motion (jako_face's default, off). The radar takes
+    // the same flag: no line and no wedge when it is on.
+    static constexpr bool kReducedMotion = false;
+    // Calms the face alone while the radar is open (the plan review's
+    // fallback if the breathing ring's commits under the radar cost too
+    // much on the board); the line and the wedge keep turning. Off until the
+    // board's frame time says otherwise.
+    static constexpr bool kRadarCalmFace = false;
+    // DESIGN-TRUTH.md section 1, the remote data screens: the face shows
+    // the error state for 2.4 s.
+    static constexpr uint32_t kRadarErrorFaceMs = 2400;
+    // How often the internal heap is logged while the radar is open.
+    static constexpr uint32_t kRadarHeapLogMs = 60000;
 
     lv_obj_t* face_ = nullptr;
     DeviceState device_state_ = kDeviceStateStarting;
@@ -285,6 +367,84 @@ private:
     std::atomic<float> level_{0.0f};
     // Milliseconds, 32 bits so the store is a single word on this chip.
     std::atomic<uint32_t> level_ms_{0};
+
+    // The radar: the object while it is open, else nullptr. The gate lives
+    // for the whole conversation, the object only while it is shown.
+    lv_obj_t* radar_ = nullptr;
+    jako_radar_seq_t radar_gate_ = {};
+    jako_radar_state_t radar_drawn_ = JAKO_RADAR_STATE_LOADING;
+    RadarErrorFace radar_error_ = RadarErrorFace::kOff;
+    uint32_t radar_error_since_ms_ = 0;
+    uint32_t radar_heap_log_ms_ = 0;
+    // What Apply last gave the face, handed to a radar that opens later.
+    jako_face_state_t face_state_ = JAKO_FACE_STATE_IDLE;
+
+    static uint32_t NowMs() { return (uint32_t)(esp_timer_get_time() / 1000); }
+
+    static bool InConversation(DeviceState state) {
+        return state == kDeviceStateListening || state == kDeviceStateSpeaking;
+    }
+
+    // Under the display lock. Just above the face, under everything else,
+    // so the low battery popup and a preview image still draw on top. The
+    // face keeps only its state ring while the radar covers the middle.
+    bool OpenRadar() {
+        radar_ = jako_radar_create(lv_screen_active());
+        if (radar_ == nullptr) {
+            ESP_LOGE(TAG, "No memory for the radar");
+            return false;
+        }
+        lv_obj_move_to_index(radar_, lv_obj_get_index(face_) + 1);
+        jako_radar_set_expire_cb(radar_, RadarExpired, this);
+        jako_radar_set_face_state(radar_, face_state_);
+        jako_radar_set_reduced_motion(radar_, kReducedMotion);
+        jako_face_set_reduced_motion(face_, kReducedMotion || kRadarCalmFace);
+        jako_face_set_show(face_, JAKO_FACE_SHOW_RING_ONLY);
+        radar_drawn_ = JAKO_RADAR_STATE_LOADING;
+        radar_heap_log_ms_ = NowMs() - kRadarHeapLogMs;  // the first update logs
+        ESP_LOGI(TAG, "Radar open");
+        return true;
+    }
+
+    // Under the display lock. Back to the whole face.
+    void CloseRadar(const char* why) {
+        if (radar_ == nullptr) {
+            return;
+        }
+        lv_obj_t* radar = radar_;
+        radar_ = nullptr;
+        lv_obj_delete(radar);
+        jako_face_set_reduced_motion(face_, kReducedMotion);
+        jako_face_set_show(face_, JAKO_FACE_SHOW_FULL);
+        radar_drawn_ = JAKO_RADAR_STATE_LOADING;
+        if (radar_error_ == RadarErrorFace::kShowing) {
+            radar_error_ = RadarErrorFace::kOff;
+            Apply();
+        }
+        ESP_LOGI(TAG, "Radar closed: %s", why);
+    }
+
+    // From the radar's own timer, in the LVGL task with the lock held, after
+    // 60 s with no applied update. The gate is left as it is: a late update
+    // of this conversation must not reopen the radar.
+    static void RadarExpired(lv_obj_t* radar, void* user) {
+        auto* self = static_cast<CustomLcdDisplay*>(user);
+        if (self->radar_ == radar) {
+            self->CloseRadar("no update for 60 s");
+        }
+    }
+
+    // Under the display lock, after an applied update.
+    void LogRadarHeap() {
+        const uint32_t now = NowMs();
+        if (now - radar_heap_log_ms_ < kRadarHeapLogMs) {
+            return;
+        }
+        radar_heap_log_ms_ = now;
+        ESP_LOGI(TAG, "Radar heap: internal free %u, largest block %u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
 
     static bool IsErrorEmotion(const char* emotion) {
         return emotion != nullptr &&
@@ -295,7 +455,7 @@ private:
     // Under the display lock.
     void Apply() {
         jako_face_state_t state = JAKO_FACE_STATE_IDLE;
-        if (layer_ == FaceLayer::kError) {
+        if (layer_ == FaceLayer::kError || radar_error_ == RadarErrorFace::kShowing) {
             state = JAKO_FACE_STATE_ERROR;
         } else if (layer_ == FaceLayer::kThinking) {
             state = JAKO_FACE_STATE_THINKING;
@@ -316,7 +476,11 @@ private:
                     break;
             }
         }
+        face_state_ = state;
         jako_face_set_state(face_, state);
+        if (radar_ != nullptr) {
+            jako_radar_set_face_state(radar_, state);  // the line holds while thinking
+        }
     }
 
     // Runs inside the face's LVGL timer, which already holds the lock.
@@ -327,6 +491,11 @@ private:
         const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         if (self->layer_ == FaceLayer::kThinking && now - self->thinking_since_ms_ > kThinkingTimeoutMs) {
             self->layer_ = FaceLayer::kNone;
+            self->Apply();
+        }
+        if (self->radar_error_ == RadarErrorFace::kShowing &&
+            now - self->radar_error_since_ms_ >= kRadarErrorFaceMs) {
+            self->radar_error_ = RadarErrorFace::kOff;
             self->Apply();
         }
         float level = 0.0f;
@@ -391,6 +560,10 @@ private:
     MotionState motion_state_ = MotionState::kOff;
     lv_timer_t* motion_timer_ = nullptr;
     int motion_failures_ = 0;
+
+    // The radar update being parsed: 856 bytes, kept here and not on the
+    // main task's stack. Only the main task touches it.
+    jako_radar_update_t radar_update_ = {};
 
     void InitializePowerSaveTimer() {
         // Dim after 60 s of quiet and never power off, so the wake word keeps listening.
@@ -460,6 +633,13 @@ private:
                 power_save_timer_->WakeUp();
                 app.SetVoiceWakeEnabled(!app.IsVoiceWakeEnabled());
             }
+        });
+
+        // Long press (1500 ms, fired while held, never also a click): the
+        // next plane on the radar, only while it is open. Button callbacks
+        // run on the timer task, so it hops to the main task first.
+        boot_button_.OnLongPress([this]() {
+            Application::GetInstance().Schedule([this]() { display_->RadarNext(); });
         });
     }
 
@@ -642,6 +822,46 @@ private:
                 EnterWifiConfigMode();
                 return true;
             });
+        InitializeRadarTools(mcp_server);
+    }
+
+    // The flight radar's two tools (docs/radar.md, wire contract v1), in
+    // both build entries. User-only: never listed, the server calls them by
+    // name during a conversation. The callbacks run on the main task.
+    void InitializeRadarTools(McpServer& mcp_server) {
+        mcp_server.AddUserOnlyTool("self.radar.update",
+            "Draw one flight radar update from the server. Returns the plane id in focus, 0 for none.",
+            PropertyList({Property("data", kPropertyTypeString).SetMaxLength(JAKO_RADAR_DATA_MAX)}),
+            [this](const PropertyList& properties) -> ToolResult {
+                return RadarUpdate(properties["data"].value<std::string>());
+            });
+        mcp_server.AddUserOnlyTool("self.radar.close",
+            "Close the flight radar and show the face again. seq is this call's id.",
+            PropertyList({Property("seq", kPropertyTypeInteger, 1, 2147483647)}),
+            [this](const PropertyList& properties) -> ToolResult {
+                display_->RadarClose(properties["seq"].value<int>());
+                return true;
+            });
+    }
+
+    // On the main task. The state check and the parse come before the display
+    // lock, so LVGL never waits on cJSON; the display checks the state again
+    // under the lock.
+    ToolResult RadarUpdate(const std::string& data) {
+        const DeviceState state = Application::GetInstance().GetDeviceState();
+        if (state != kDeviceStateListening && state != kDeviceStateSpeaking) {
+            return std::unexpected(std::string("radar: not in a conversation"));
+        }
+        const jako_radar_parse_result_t parsed =
+            jako_radar_parse(data.data(), data.size(), &radar_update_);
+        if (parsed != JAKO_RADAR_PARSE_OK) {
+            return std::unexpected(std::string("radar: ") + jako_radar_parse_reason(parsed));
+        }
+        auto shown = display_->RadarUpdate(radar_update_);
+        if (!shown) {
+            return std::unexpected(shown.error());
+        }
+        return *shown;
     }
 
 public:
