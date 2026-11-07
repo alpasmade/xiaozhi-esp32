@@ -17,3 +17,5 @@ In the smaller form, the 1.75-inch capacitive HD AMOLED screen, highly integrate
 Jakomotchi: Jako's face (jako_face.c) and body events (jako_body.c, jako_motion.cc: shake, cable in, battery full) live in this folder; see docs/body-events.md in the Jakomotchi repository.
 
 The flight radar: the widget (jako_radar.c), the parser of the update's data and the seq gate (jako_radar_data.c, no device header), and Inter SemiBold at 20 and 22 px (font_inter_600_*_4.c, made by firmware/face-preview/gen_fonts.py, under the licence in font_inter_OFL.txt). firmware/face-preview/render.sh renders and checks them on the Mac; see docs/radar.md in the Jakomotchi repository.
+
+The dial of today (jako_dial.c, its parser jako_dial_data.c), Jako's pictures (the scene widget jako_scene.c, its parser jako_scene_data.c) and the screen slot that decides what lies over the face (jako_screens.c, a pure reducer with no device header) live here too. The face's small mode is JAKO_FACE_SHOW_SMALL in jako_face.c. firmware/face-preview/render.sh renders and checks all of them on the Mac; see docs/screens.md in the Jakomotchi repository.

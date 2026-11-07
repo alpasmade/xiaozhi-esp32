@@ -44,10 +44,14 @@ typedef enum {
 
 /* What the face draws. RING_ONLY keeps the state ring and draws no eyes or
    mouth, for a screen (the radar) that covers the middle: the ring stays
-   true and the eyes cost no redraws underneath. */
+   true and the eyes cost no redraws underneath. SMALL draws the eyes,
+   mouth, glow and hearts at half the unit (the face as the engine draws it
+   at half the size) about the screen centre, for the dial round it, and the
+   ring at the full unit exactly as FULL does. */
 typedef enum {
     JAKO_FACE_SHOW_FULL = 0,
     JAKO_FACE_SHOW_RING_ONLY,
+    JAKO_FACE_SHOW_SMALL,
 } jako_face_show_t;
 
 typedef enum {
@@ -82,7 +86,7 @@ typedef struct {
     const char* body;         /* timed body reaction: "none", "dizzy" or "happy" */
     float body_left;          /* seconds of it left */
     float lean_x, lean_y;     /* the held lean in units, after the clamp */
-    jako_face_show_t show;    /* full, or the ring alone */
+    jako_face_show_t show;    /* full, the ring alone, or small */
 } jako_face_debug_t;
 
 typedef void (*jako_face_pre_tick_cb_t)(lv_obj_t* face, void* user);
@@ -111,10 +115,12 @@ void jako_face_body_event(lv_obj_t* face, jako_face_body_event_t event);
    (0, 0) lets the glance return. Whoever drives it sets (0, 0) when its
    source stops, so a lean never sticks. */
 void jako_face_set_lean(lv_obj_t* face, float x, float y);
-/* FULL (the default) or RING_ONLY. Everything else keeps running in
-   RING_ONLY (state, blinks, glances, the ring's commits); only the eyes and
-   mouth are not drawn. Entering it invalidates the eyes and mouth once;
-   leaving it invalidates the whole face. */
+/* FULL (the default), RING_ONLY or SMALL. Everything else keeps running in
+   every mode (state, blinks, glances, the ring's commits); RING_ONLY draws
+   no eyes or mouth, SMALL draws them at half the unit. Entering RING_ONLY
+   invalidates the eyes and mouth once; leaving it invalidates the whole
+   face. A change between FULL and SMALL invalidates the eyes and mouth (old
+   and new bounds), never the ring. */
 void jako_face_set_show(lv_obj_t* face, jako_face_show_t show);
 /* Jump every easing to its target, as snap() in the engine. */
 void jako_face_snap(lv_obj_t* face);

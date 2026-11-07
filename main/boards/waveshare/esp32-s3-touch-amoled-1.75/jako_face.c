@@ -8,7 +8,11 @@
 
    Each tick the face computes its integer geometry, compares it with what
    was drawn last, and invalidates only the parts that changed. The draw
-   callback only draws that geometry; it never invalidates. */
+   callback only draws that geometry; it never invalidates.
+
+   Three show modes: FULL, RING_ONLY (no eyes or mouth, under the radar) and
+   SMALL (under the dial: the eyes, mouth, glow and hearts at an eye unit of
+   half the unit about the screen centre, the ring at the full unit). */
 #include "jako_face.h"
 #include "jako_face_port.h"
 
@@ -153,7 +157,8 @@ typedef struct {
 } jf_ring_geom_t;
 
 typedef struct {
-    int32_t g04, g08;
+    int32_t g04, g08;   /* the eyes' and mouth's glow growth: at the eye unit */
+    int32_t rg04, rg08; /* the ring's glow growth: always at the full unit */
     jf_eye_geom_t eye[2];
     jf_mouth_geom_t mouth;
     jf_ring_geom_t ring;
@@ -714,15 +719,21 @@ static void jf_compute(const jf_t* f, jf_geom_t* g)
     const int32_t w = lv_area_get_width(&c);
     if (w <= 0) return;
     const float u = (float)w / JF_UNITS, x0 = (float)c.x1, y0 = (float)c.y1;
-    g->g04 = jf_round(0.4f * u);
-    g->g08 = jf_round(0.8f * u);
+    /* small: the eyes, mouth, glow and hearts at half the unit about the centre; the ring keeps u */
+    const bool small = f->show == JAKO_FACE_SHOW_SMALL;
+    const float ue = small ? 0.5f * u : u;
+    const float x0e = small ? x0 + JF_HALF * (u - ue) : x0, y0e = small ? y0 + JF_HALF * (u - ue) : y0;
+    g->g04 = jf_round(0.4f * ue);
+    g->g08 = jf_round(0.8f * ue);
+    g->rg04 = jf_round(0.4f * u);
+    g->rg08 = jf_round(0.8f * u);
     /* ring only: the eyes and mouth stay empty (kind none, empty bounds), so
        their old areas are invalidated once and nothing draws there after */
     if (f->show != JAKO_FACE_SHOW_RING_ONLY) {
         const float blink = jf_blink_amount(f);
         const bool hearts = jf_hearts(f);
-        for (int i = 0; i < 2; i++) jf_eye_geom(f, g, i, u, x0, y0, blink, hearts);
-        jf_mouth_geom(f, g, u, x0, y0);
+        for (int i = 0; i < 2; i++) jf_eye_geom(f, g, i, ue, x0e, y0e, blink, hearts);
+        jf_mouth_geom(f, g, ue, x0e, y0e);
     }
     jf_ring_geom(f, g, u, x0, y0);
 }
@@ -759,11 +770,11 @@ static void jf_invalidate_changes(jf_t* f, const jf_geom_t* o, const jf_geom_t* 
     const jf_ring_geom_t *ro = &o->ring, *rn = &n->ring;
     const bool look_changed = ro->mode != rn->mode || ro->opa != rn->opa || ro->color != rn->color;
     const bool moved = ro->radius != rn->radius || ro->width != rn->width || ro->center.x != rn->center.x ||
-                       ro->center.y != rn->center.y || o->g08 != n->g08;
+                       ro->center.y != rn->center.y || o->rg08 != n->rg08;
     const bool full_old = ro->mode == JAKO_FACE_RING_FULL, full_new = rn->mode == JAKO_FACE_RING_FULL;
     if ((full_old || full_new) && (look_changed || moved)) {
-        if (full_new) jf_inval_ring_tiles(f, rn, n->g08);
-        if (full_old && (!full_new || moved)) jf_inval_ring_tiles(f, ro, o->g08);
+        if (full_new) jf_inval_ring_tiles(f, rn, n->rg08);
+        if (full_old && (!full_new || moved)) jf_inval_ring_tiles(f, ro, o->rg08);
     }
     for (int i = 0; i < JF_COMET_SEGS; i++)
         if (memcmp(&ro->seg[i], &rn->seg[i], sizeof(ro->seg[i])) != 0 || (look_changed && ro->color != rn->color))
@@ -833,12 +844,13 @@ static void jf_arc(lv_layer_t* layer, lv_obj_t* obj, lv_point_t c, int32_t radiu
     lv_draw_arc(layer, &d);
 }
 
+/* g04 and g08: the glow's growth, the eye unit's for the mouth and the full unit's for the ring */
 static void jf_arc_glow(lv_layer_t* layer, lv_obj_t* obj, lv_point_t c, int32_t radius, int32_t width, int32_t a0,
-                        int32_t a1, bool rounded, const jf_geom_t* g, lv_color_t color, int32_t opa)
+                        int32_t a1, bool rounded, int32_t g04, int32_t g08, lv_color_t color, int32_t opa)
 {
-    jf_arc(layer, obj, c, radius + g->g08, width + 2 * g->g08, a0, a1, rounded, color,
+    jf_arc(layer, obj, c, radius + g08, width + 2 * g08, a0, a1, rounded, color,
            (opa * JF_GLOW_OUTER_OPA + 127) / 255);
-    jf_arc(layer, obj, c, radius + g->g04, width + 2 * g->g04, a0, a1, rounded, color,
+    jf_arc(layer, obj, c, radius + g04, width + 2 * g04, a0, a1, rounded, color,
            (opa * JF_GLOW_INNER_OPA + 127) / 255);
     jf_arc(layer, obj, c, radius, width, a0, a1, rounded, color, opa);
 }
@@ -888,7 +900,7 @@ static void jf_draw_ring(lv_layer_t* layer, lv_obj_t* obj, const jf_geom_t* g)
     if (r->mode == JAKO_FACE_RING_NONE || r->color < 0) return;
     const lv_color_t color = lv_color_hex((uint32_t)r->color);
     if (r->mode == JAKO_FACE_RING_FULL) {
-        jf_arc_glow(layer, obj, r->center, r->radius, r->width, 0, 360, false, g, color, r->opa);
+        jf_arc_glow(layer, obj, r->center, r->radius, r->width, 0, 360, false, g->rg04, g->rg08, color, r->opa);
         return;
     }
     for (int i = 0; i < JF_COMET_SEGS; i++) {
@@ -903,7 +915,8 @@ static void jf_draw_mouth(lv_layer_t* layer, lv_obj_t* obj, const jf_geom_t* g)
     const jf_mouth_geom_t* m = &g->mouth;
     const lv_color_t light = lv_color_hex(JF_LIGHT);
     if (m->kind == JF_MG_ARC)
-        jf_arc_glow(layer, obj, m->center, m->radius, m->width, m->start, m->end, true, g, light, LV_OPA_COVER);
+        jf_arc_glow(layer, obj, m->center, m->radius, m->width, m->start, m->end, true, g->g04, g->g08, light,
+                    LV_OPA_COVER);
     else if (m->kind == JF_MG_RECT)
         jf_fill_glow(layer, obj, &m->rect, m->rect_radius, g, light);
 }
@@ -1031,7 +1044,7 @@ void jako_face_set_show(lv_obj_t* obj, jako_face_show_t show)
 {
     jf_t* f = jf_get(obj);
     if (f == NULL) return;
-    if (show != JAKO_FACE_SHOW_RING_ONLY) show = JAKO_FACE_SHOW_FULL;
+    if (show != JAKO_FACE_SHOW_RING_ONLY && show != JAKO_FACE_SHOW_SMALL) show = JAKO_FACE_SHOW_FULL;
     if (show == f->show) return;
     const jako_face_show_t was = f->show;
     f->show = show;

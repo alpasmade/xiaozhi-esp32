@@ -31,12 +31,16 @@
 #include <cmath>
 #include <cstring>
 #include <expected>
+#include <functional>
 #include <string>
 
 #include "jako_body.h"
+#include "jako_dial.h"
 #include "jako_face.h"
 #include "jako_motion.h"
 #include "jako_radar.h"
+#include "jako_scene.h"
+#include "jako_screens.h"
 
 #define TAG "WaveshareEsp32s3TouchAMOLED1inch75"
 
@@ -184,6 +188,7 @@ public:
 
     virtual void SetDeviceState(DeviceState state) override {
         DisplayLockGuard lock(this);
+        const DeviceState was = device_state_;
         device_state_ = state;
         if (face_ == nullptr) {
             return;
@@ -200,13 +205,14 @@ public:
         if (state == kDeviceStateFatalError) {
             layer_ = FaceLayer::kError;
         }
-        // The radar rides on the conversation: any other state (the socket
-        // closed, an error, idle) closes it, and the next socket's ids
-        // start again at 1.
-        if (!InConversation(state)) {
-            CloseRadar("the conversation ended");
-            jako_radar_seq_reset(&radar_gate_);
-        }
+        // The radar and a scene ride on the conversation: any other state
+        // (the socket closed, an error, idle) closes them, every seq gate
+        // resets so the next socket's ids start again at 1, and at rest the
+        // dial may come to the front (the slot's rules, jako_screens.h).
+        Screens(jako_screens_ev_device(SlotDevice(state)),
+                InConversation(state)  ? "a conversation"
+                : InConversation(was) ? "the conversation ended"
+                                      : "no conversation");
         Apply();
     }
 
@@ -277,13 +283,19 @@ public:
         level_ms_.store((uint32_t)(esp_timer_get_time() / 1000), std::memory_order_release);
     }
 
-    // The flight radar (docs/radar.md, wire contract v1). The tools parse on
-    // the main task and hand a checked update here; the rest runs under the
-    // display lock, which also guards the seq gate, so the state change and
-    // the 60 s close agree with the tools.
+    // The screens in front of the face: the flight radar (docs/radar.md,
+    // wire contract v1), the dial of today and Jako's pictures, the scenes
+    // (docs/screens.md). The tools parse on the main task and hand a checked
+    // update here; the rest runs under the display lock, which also guards
+    // the seq gates, so a state change and the widgets' own timers agree
+    // with the tools. Which screen is in front, the face's show mode, the
+    // long press, the error face and the gates are the slot's to decide
+    // (jako_screens.c, tested on the Mac); this class only applies its
+    // output (Screens below).
 
-    // Draws an update: opens the radar on the first one the gate admits.
-    // Returns the plane id in focus on screen, 0 for none, or the refusal.
+    // Draws a radar update: opens the radar on the first one the gate
+    // admits. Returns the plane id in focus on screen, 0 for none, or the
+    // refusal.
     std::expected<int, std::string> RadarUpdate(const jako_radar_update_t& update) {
         DisplayLockGuard lock(this);
         if (face_ == nullptr) {
@@ -299,44 +311,149 @@ public:
         if (radar_ == nullptr && !OpenRadar()) {
             return std::unexpected(std::string("radar: no memory"));
         }
-        // "No flight data": the face shows error for 2.4 s, as the mock does.
-        if (update.state == JAKO_RADAR_STATE_ERROR && radar_drawn_ != JAKO_RADAR_STATE_ERROR) {
-            radar_error_ = RadarErrorFace::kShowing;
-            radar_error_since_ms_ = NowMs();
-            Apply();
-        }
-        radar_drawn_ = update.state;
         const int focus = (int)jako_radar_apply(radar_, &update);
+        // "No flight data" shows the face's error for 2.4 s (the slot starts it).
+        Screens(jako_screens_ev_radar_applied(RadarData(update.state)), "a radar opened");
         LogRadarHeap();
         return focus;
     }
 
-    // The close tool. Outside a conversation the gate was already reset; a
-    // close that arrives late must not raise it for the next socket.
+    // The radar's close tool. Outside a conversation the radar is already
+    // closed and the gate already reset; a close that arrives late must not
+    // raise it for the next socket, so it changes nothing (plan 5.1).
     void RadarClose(int seq) {
         DisplayLockGuard lock(this);
-        if (InConversation(device_state_)) {
-            jako_radar_seq_close(&radar_gate_, seq);
-        }
-        CloseRadar("the close tool");
-    }
-
-    // The long press: the next plane, only while the radar is open.
-    void RadarNext() {
-        DisplayLockGuard lock(this);
-        if (radar_ == nullptr) {
+        if (face_ == nullptr || !InConversation(device_state_)) {
             return;
         }
-        [[maybe_unused]] const uint16_t focus = jako_radar_next(radar_);  // outside the log: it may compile out
-        ESP_LOGI(TAG, "Radar: long press, focus %u", (unsigned)focus);
+        jako_radar_seq_close(&radar_gate_, seq);
+        Screens(jako_screens_ev(JAKO_SCREENS_EV_RADAR_CLOSED), "the close tool");
+    }
+
+    // Draws a dial update. The dial object is made by the first one the gate
+    // admits and never deleted after that: its cache is what it shows at
+    // rest. Whether it comes to the front is the slot's call: only after
+    // "show my day" in a conversation, and at rest with home on. Returns the
+    // look shown (always 0 in slice 1), or the refusal.
+    std::expected<int, std::string> DialUpdate(const jako_dial_update_t& update) {
+        DisplayLockGuard lock(this);
+        if (face_ == nullptr) {
+            return std::unexpected(std::string("dial: no face on this screen"));
+        }
+        if (!InConversation(device_state_)) {
+            return std::unexpected(std::string("dial: not in a conversation"));
+        }
+        if (!jako_dial_seq_admit(&dial_gate_, update.seq)) {
+            return 0;  // a retry or a late update: not drawn, the look on screen is now
+        }
+        if (dial_ == nullptr && !MakeDial()) {
+            return std::unexpected(std::string("dial: no memory"));
+        }
+        // "Show my day": an admitted update whose ask is not 0 and new in this
+        // conversation. ask 0 is never admitted, so the server's probe and its
+        // refreshes keep the full face (L6).
+        const jako_screens_dial_call_t call = jako_dial_ask_admit(&dial_gate_, update.ask)
+                                                  ? JAKO_SCREENS_DIAL_SHOW_MY_DAY
+                                                  : JAKO_SCREENS_DIAL_REFRESH;
+        const int32_t look = jako_dial_apply(dial_, &update);
+        const jako_screens_cache_t cache = jako_dial_rest(dial_) == JAKO_DIAL_REST_SHOWABLE
+                                               ? JAKO_SCREENS_CACHE_SHOWABLE
+                                               : JAKO_SCREENS_CACHE_NONE;
+        Screens(jako_screens_ev_dial_applied(DialData(jako_dial_screen(dial_)),
+                                             update.home != 0 ? JAKO_SCREENS_HOME_ON : JAKO_SCREENS_HOME_OFF,
+                                             cache, call),
+                call == JAKO_SCREENS_DIAL_SHOW_MY_DAY ? "show my day" : "a dial refresh");
+        return (int)look;
+    }
+
+    // The dial's close tool ("show your face", "close the dial"): hides the
+    // dial now and at rest until its next applied update; the cache stays.
+    // Outside a conversation it changes nothing (plan 5.1): a late close
+    // must not hide the home screen at rest.
+    void DialClose(int seq) {
+        DisplayLockGuard lock(this);
+        if (face_ == nullptr) {
+            return;
+        }
+        if (!InConversation(device_state_)) {
+            ESP_LOGI(TAG, "Dial close outside a conversation: nothing changes");
+            return;
+        }
+        jako_dial_seq_close(&dial_gate_, seq);
+        Screens(jako_screens_ev(JAKO_SCREENS_EV_DIAL_CLOSED), "the close tool");
+    }
+
+    // Draws a scene: opens one on the first update the gate admits, in
+    // front, closing the radar. The order is parse (the caller), the gate,
+    // the device's own edge check of the texts, then apply, so a refusal
+    // never opens anything and keeps the picture. Returns the id of the
+    // scene shown ("" for none), or the refusal.
+    std::expected<std::string, std::string> SceneUpdate(const jako_scene_update_t& update) {
+        DisplayLockGuard lock(this);
+        if (face_ == nullptr) {
+            return std::unexpected(std::string("scene: no face on this screen"));
+        }
+        if (!InConversation(device_state_)) {
+            return std::unexpected(std::string("scene: not in a conversation"));
+        }
+        if (!jako_scene_seq_admit(&scene_gate_, update.seq)) {
+            // A retry or a late update: not drawn, the scene on screen is the answer.
+            return std::string(scene_ != nullptr ? jako_scene_id(scene_) : "");
+        }
+        const jako_scene_apply_t checked = jako_scene_check(&update);
+        if (checked != JAKO_SCENE_APPLY_SHOWN) {
+            return std::unexpected(std::string("scene: ") + jako_scene_apply_reason(checked));
+        }
+        if (scene_ == nullptr && !OpenScene()) {
+            return std::unexpected(std::string("scene: no memory"));
+        }
+        const jako_scene_apply_t applied = jako_scene_apply(scene_, &update);
+        if (applied != JAKO_SCENE_APPLY_SHOWN && applied != JAKO_SCENE_APPLY_SAME) {
+            // Not expected after the check. A scene that opened for this
+            // update and drew nothing closes again; an open one keeps its picture.
+            if (screens_.front != JAKO_SCREENS_FRONT_SCENE) {
+                DeleteScene("its first update was refused");
+            }
+            return std::unexpected(std::string("scene: ") + jako_scene_apply_reason(applied));
+        }
+        // An error scene shows the face's error for 2.4 s (the slot starts it).
+        Screens(jako_screens_ev_scene_applied(SceneData(update.state)), "a scene opened");
+        LogSceneHeap();
+        return std::string(scene_ != nullptr ? jako_scene_id(scene_) : "");
+    }
+
+    // The scene's close tool. Outside a conversation the scene is already
+    // closed and the gate already reset, so it changes nothing.
+    void SceneClose(int seq) {
+        DisplayLockGuard lock(this);
+        if (face_ == nullptr || !InConversation(device_state_)) {
+            return;
+        }
+        jako_scene_seq_close(&scene_gate_, seq);
+        Screens(jako_screens_ev(JAKO_SCREENS_EV_SCENE_CLOSED), "the close tool");
+    }
+
+    // The long press: the radar's next plane while it is in front, nothing
+    // for the dial and a scene in slice 1. With any screen in front the
+    // dimmed screen wakes first, since a person pressing is looking at it.
+    void LongPress() {
+        DisplayLockGuard lock(this);
+        if (face_ == nullptr) {
+            return;
+        }
+        Screens(jako_screens_ev(JAKO_SCREENS_EV_LONG_PRESS), "long press");
+    }
+
+    // How the slot wakes the dimmed screen (the board's power save timer).
+    // Set once by the board after both exist; called on the main task.
+    void SetWakeScreen(std::function<void()> wake) {
+        DisplayLockGuard lock(this);
+        wake_screen_ = std::move(wake);
     }
 
 private:
     // What sits on top of the device state. Named states, not flags.
     enum class FaceLayer { kNone, kThinking, kError };
-    // The radar's error face: shown for kRadarErrorFaceMs when an update
-    // turns to "No flight data", above thinking, under a latched error.
-    enum class RadarErrorFace { kOff, kShowing };
 
     // A level older than this means playback has paused: the mouth closes.
     static constexpr uint32_t kLevelTimeoutMs = 100;
@@ -346,8 +463,9 @@ private:
     // dBFS that maps to a closed and a fully open mouth. Tune on the board.
     static constexpr float kLevelFloorDb = -45.0f;
     static constexpr float kLevelRangeDb = 35.0f;
-    // The face's reduced motion (jako_face's default, off). The radar takes
-    // the same flag: no line and no wedge when it is on.
+    // The face's reduced motion (jako_face's default, off). The radar, the
+    // dial and scenes take the same flag: no line and no wedge on the
+    // radar, no pulse on the dial's or a scene's loading track.
     static constexpr bool kReducedMotion = false;
     // Calms the face alone while the radar is open (the plan review's
     // fallback if the breathing ring's commits under the radar cost too
@@ -355,10 +473,12 @@ private:
     // board's frame time says otherwise.
     static constexpr bool kRadarCalmFace = false;
     // DESIGN-TRUTH.md section 1, the remote data screens: the face shows
-    // the error state for 2.4 s.
-    static constexpr uint32_t kRadarErrorFaceMs = 2400;
-    // How often the internal heap is logged while the radar is open.
+    // the error state for 2.4 s, for the radar, the dial and a scene alike.
+    static constexpr uint32_t kErrorFaceMs = 2400;
+    static_assert(kErrorFaceMs == JAKO_DIAL_ERROR_FACE_MS, "one error face for every screen");
+    // How often the internal heap is logged while the radar or a scene is open.
     static constexpr uint32_t kRadarHeapLogMs = 60000;
+    static constexpr uint32_t kSceneHeapLogMs = 60000;
 
     lv_obj_t* face_ = nullptr;
     DeviceState device_state_ = kDeviceStateStarting;
@@ -368,16 +488,30 @@ private:
     // Milliseconds, 32 bits so the store is a single word on this chip.
     std::atomic<uint32_t> level_ms_{0};
 
+    // The slot: what is in front of the face, and the error face. Changed
+    // only by Screens, under the display lock.
+    jako_screens_t screens_ = jako_screens_init();
+    uint32_t error_face_since_ms_ = 0;
+    std::function<void()> wake_screen_;
+
     // The radar: the object while it is open, else nullptr. The gate lives
     // for the whole conversation, the object only while it is shown.
     lv_obj_t* radar_ = nullptr;
     jako_radar_seq_t radar_gate_ = {};
-    jako_radar_state_t radar_drawn_ = JAKO_RADAR_STATE_LOADING;
-    RadarErrorFace radar_error_ = RadarErrorFace::kOff;
-    uint32_t radar_error_since_ms_ = 0;
     uint32_t radar_heap_log_ms_ = 0;
     // What Apply last gave the face, handed to a radar that opens later.
     jako_face_state_t face_state_ = JAKO_FACE_STATE_IDLE;
+
+    // The dial: made by its first applied update and kept for good (hidden,
+    // never deleted), so its cache and clock live on at rest. Its gate holds
+    // the last seq and the last ask of this conversation.
+    lv_obj_t* dial_ = nullptr;
+    jako_dial_seq_t dial_gate_ = MakeDialGate();
+
+    // A scene: the object while it is open, else nullptr.
+    lv_obj_t* scene_ = nullptr;
+    jako_scene_seq_t scene_gate_ = {};
+    uint32_t scene_heap_log_ms_ = 0;
 
     static uint32_t NowMs() { return (uint32_t)(esp_timer_get_time() / 1000); }
 
@@ -385,29 +519,159 @@ private:
         return state == kDeviceStateListening || state == kDeviceStateSpeaking;
     }
 
-    // Under the display lock. Just above the face, under everything else,
-    // so the low battery popup and a preview image still draw on top. The
-    // face keeps only its state ring while the radar covers the middle.
+    // jako_dial_seq_reset, not {0}: the gate's documented start.
+    static jako_dial_seq_t MakeDialGate() {
+        jako_dial_seq_t gate;
+        jako_dial_seq_reset(&gate);
+        return gate;
+    }
+
+    // The device state as the slot sees it (jako_screens.h).
+    static jako_screens_device_t SlotDevice(DeviceState state) {
+        switch (state) {
+            case kDeviceStateIdle:
+                return JAKO_SCREENS_DEVICE_IDLE;
+            case kDeviceStateListening:
+                return JAKO_SCREENS_DEVICE_LISTENING;
+            case kDeviceStateSpeaking:
+                return JAKO_SCREENS_DEVICE_SPEAKING;
+            default:
+                return JAKO_SCREENS_DEVICE_OTHER;
+        }
+    }
+
+    static jako_screens_data_t RadarData(jako_radar_state_t state) {
+        switch (state) {
+            case JAKO_RADAR_STATE_LIVE:
+                return JAKO_SCREENS_DATA_READY;
+            case JAKO_RADAR_STATE_EMPTY:
+                return JAKO_SCREENS_DATA_EMPTY;
+            case JAKO_RADAR_STATE_ERROR:
+                return JAKO_SCREENS_DATA_ERROR;
+            default:
+                return JAKO_SCREENS_DATA_LOADING;
+        }
+    }
+
+    static jako_screens_data_t SceneData(jako_scene_state_t state) {
+        switch (state) {
+            case JAKO_SCENE_STATE_READY:
+                return JAKO_SCREENS_DATA_READY;
+            case JAKO_SCENE_STATE_EMPTY:
+                return JAKO_SCREENS_DATA_EMPTY;
+            case JAKO_SCENE_STATE_ERROR:
+                return JAKO_SCREENS_DATA_ERROR;
+            default:
+                return JAKO_SCREENS_DATA_LOADING;
+        }
+    }
+
+    // What the dial shows after an apply, for the slot's error face: only an
+    // error with nothing cached ("No agenda" on the bare frame) is an error;
+    // an error over a cache still shows the day, dimmed.
+    static jako_screens_data_t DialData(jako_dial_screen_t screen) {
+        switch (screen) {
+            case JAKO_DIAL_SCREEN_LOADING:
+                return JAKO_SCREENS_DATA_LOADING;
+            case JAKO_DIAL_SCREEN_EMPTY:
+                return JAKO_SCREENS_DATA_EMPTY;
+            case JAKO_DIAL_SCREEN_ERROR:
+                return JAKO_SCREENS_DATA_ERROR;
+            default:
+                return JAKO_SCREENS_DATA_READY;
+        }
+    }
+
+    // Under the display lock. One step of the slot, applied in its order:
+    // wake, delete, widgets, face, press, gates, error face.
+    void Screens(jako_screens_event_t event, const char* why) {
+        if (face_ == nullptr) {
+            return;
+        }
+        const jako_screens_front_t was = screens_.front;
+        const jako_screens_step_t step = jako_screens_reduce(screens_, event);
+        screens_ = step.state;
+        const jako_screens_out_t& out = step.out;
+
+        if (out.wake == JAKO_SCREENS_WAKE_SCREEN && wake_screen_) {
+            wake_screen_();
+        }
+        if (out.deleted == JAKO_SCREENS_DELETE_RADAR || (out.radar == JAKO_SCREENS_WIDGET_ABSENT && radar_ != nullptr)) {
+            DeleteRadar(why);
+        }
+        if (out.deleted == JAKO_SCREENS_DELETE_SCENE || (out.scene == JAKO_SCREENS_WIDGET_ABSENT && scene_ != nullptr)) {
+            DeleteScene(why);
+        }
+        if (dial_ != nullptr) {
+            if (out.dial == JAKO_SCREENS_WIDGET_SHOWN) {
+                lv_obj_remove_flag(dial_, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(dial_, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        jako_face_set_show(face_, out.face == JAKO_SCREENS_FACE_SMALL       ? JAKO_FACE_SHOW_SMALL
+                                  : out.face == JAKO_SCREENS_FACE_RING_ONLY ? JAKO_FACE_SHOW_RING_ONLY
+                                                                            : JAKO_FACE_SHOW_FULL);
+        if (out.press == JAKO_SCREENS_PRESS_NEXT_PLANE && radar_ != nullptr) {
+            [[maybe_unused]] const uint16_t focus = jako_radar_next(radar_);  // outside the log: it may compile out
+            ESP_LOGI(TAG, "Radar: long press, focus %u", (unsigned)focus);
+        }
+        if (out.gates == JAKO_SCREENS_GATES_RESET_ALL) {
+            // The next socket's ids start again at 1, and its "show my day"
+            // counts from ask 1 again (amendment 8).
+            jako_radar_seq_reset(&radar_gate_);
+            jako_dial_seq_reset(&dial_gate_);
+            jako_scene_seq_reset(&scene_gate_);
+        }
+        if (out.error_face == JAKO_SCREENS_ERROR_FACE_START) {
+            error_face_since_ms_ = NowMs();
+            Apply();
+        } else if (out.error_face == JAKO_SCREENS_ERROR_FACE_STOP) {
+            Apply();
+        }
+        // One line per step a person could see, or that was refused: an
+        // update or a state change that moves nothing stays quiet, so the
+        // radar's and the dial's loops do not fill the log.
+        const bool routine = event.kind == JAKO_SCREENS_EV_DEVICE_STATE ||
+                             event.kind == JAKO_SCREENS_EV_RADAR_APPLIED ||
+                             event.kind == JAKO_SCREENS_EV_SCENE_APPLIED ||
+                             event.kind == JAKO_SCREENS_EV_DIAL_APPLIED;
+        if (!routine || out.front != was || out.deleted != JAKO_SCREENS_DELETE_NONE ||
+            out.verdict != JAKO_SCREENS_TAKEN || out.error_face != JAKO_SCREENS_ERROR_FACE_KEEP) {
+            ESP_LOGI(TAG, "Screens: %s (%s) -> %s, face %s, %s", jako_screens_event_name(event.kind), why,
+                     jako_screens_front_name(out.front), jako_screens_face_name(out.face),
+                     jako_screens_verdict_name(out.verdict));
+        }
+    }
+
+    // Where a radar or a scene goes: above the dial when there is one, else
+    // just above the face, under everything else, so the low battery popup
+    // and a preview image still draw on top.
+    void PlaceAboveDial(lv_obj_t* obj) {
+        lv_obj_move_to_index(obj, lv_obj_get_index(dial_ != nullptr ? dial_ : face_) + 1);
+    }
+
+    // Under the display lock. The slot sets the face's show mode once the
+    // update is applied.
     bool OpenRadar() {
         radar_ = jako_radar_create(lv_screen_active());
         if (radar_ == nullptr) {
             ESP_LOGE(TAG, "No memory for the radar");
             return false;
         }
-        lv_obj_move_to_index(radar_, lv_obj_get_index(face_) + 1);
+        PlaceAboveDial(radar_);
         jako_radar_set_expire_cb(radar_, RadarExpired, this);
         jako_radar_set_face_state(radar_, face_state_);
         jako_radar_set_reduced_motion(radar_, kReducedMotion);
         jako_face_set_reduced_motion(face_, kReducedMotion || kRadarCalmFace);
         jako_face_set_show(face_, JAKO_FACE_SHOW_RING_ONLY);
-        radar_drawn_ = JAKO_RADAR_STATE_LOADING;
         radar_heap_log_ms_ = NowMs() - kRadarHeapLogMs;  // the first update logs
         ESP_LOGI(TAG, "Radar open");
         return true;
     }
 
-    // Under the display lock. Back to the whole face.
-    void CloseRadar(const char* why) {
+    // Under the display lock, from Screens only. The face's show mode is the slot's.
+    void DeleteRadar(const char* why) {
         if (radar_ == nullptr) {
             return;
         }
@@ -415,12 +679,6 @@ private:
         radar_ = nullptr;
         lv_obj_delete(radar);
         jako_face_set_reduced_motion(face_, kReducedMotion);
-        jako_face_set_show(face_, JAKO_FACE_SHOW_FULL);
-        radar_drawn_ = JAKO_RADAR_STATE_LOADING;
-        if (radar_error_ == RadarErrorFace::kShowing) {
-            radar_error_ = RadarErrorFace::kOff;
-            Apply();
-        }
         ESP_LOGI(TAG, "Radar closed: %s", why);
     }
 
@@ -430,7 +688,69 @@ private:
     static void RadarExpired(lv_obj_t* radar, void* user) {
         auto* self = static_cast<CustomLcdDisplay*>(user);
         if (self->radar_ == radar) {
-            self->CloseRadar("no update for 60 s");
+            self->Screens(jako_screens_ev(JAKO_SCREENS_EV_RADAR_EXPIRED), "no update for 60 s");
+        }
+    }
+
+    // Under the display lock. Just above the face and under any radar or
+    // scene; hidden until the slot says otherwise.
+    bool MakeDial() {
+        dial_ = jako_dial_create(lv_screen_active());
+        if (dial_ == nullptr) {
+            ESP_LOGE(TAG, "No memory for the dial");
+            return false;
+        }
+        lv_obj_add_flag(dial_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_to_index(dial_, lv_obj_get_index(face_) + 1);
+        jako_dial_set_rest_cb(dial_, DialRestLapsed, this);
+        jako_dial_set_reduced_motion(dial_, kReducedMotion);
+        ESP_LOGI(TAG, "Dial made");
+        return true;
+    }
+
+    // From the dial's own timer, in the LVGL task with the lock held: its
+    // cache stopped covering now or turned 12 h old, so it may no longer
+    // stand alone at rest. The dial is hidden, never deleted.
+    static void DialRestLapsed(lv_obj_t* dial, void* user) {
+        auto* self = static_cast<CustomLcdDisplay*>(user);
+        if (self->dial_ == dial) {
+            self->Screens(jako_screens_ev(JAKO_SCREENS_EV_DIAL_CACHE_LAPSED), "the dial's day ran out");
+        }
+    }
+
+    // Under the display lock. The slot sets the face's show mode once the
+    // update is applied.
+    bool OpenScene() {
+        scene_ = jako_scene_create(lv_screen_active());
+        if (scene_ == nullptr) {
+            ESP_LOGE(TAG, "No memory for the scene");
+            return false;
+        }
+        PlaceAboveDial(scene_);
+        jako_scene_set_expire_cb(scene_, SceneExpired, this);
+        jako_scene_set_reduced_motion(scene_, kReducedMotion);
+        scene_heap_log_ms_ = NowMs() - kSceneHeapLogMs;  // the first update logs
+        ESP_LOGI(TAG, "Scene open");
+        return true;
+    }
+
+    // Under the display lock, from Screens and SceneUpdate only.
+    void DeleteScene(const char* why) {
+        if (scene_ == nullptr) {
+            return;
+        }
+        lv_obj_t* scene = scene_;
+        scene_ = nullptr;
+        lv_obj_delete(scene);
+        ESP_LOGI(TAG, "Scene closed: %s", why);
+    }
+
+    // From the scene's own timer, in the LVGL task with the lock held, after
+    // its hold (60 s) with no applied update. The gate is left as it is.
+    static void SceneExpired(lv_obj_t* scene, void* user) {
+        auto* self = static_cast<CustomLcdDisplay*>(user);
+        if (self->scene_ == scene) {
+            self->Screens(jako_screens_ev(JAKO_SCREENS_EV_SCENE_EXPIRED), "no update for its hold");
         }
     }
 
@@ -446,6 +766,20 @@ private:
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     }
 
+    // Under the display lock, after an applied update: the internal heap
+    // (cJSON's nodes) and PSRAM (the data strings, the LVGL pool's neighbours).
+    void LogSceneHeap() {
+        const uint32_t now = NowMs();
+        if (now - scene_heap_log_ms_ < kSceneHeapLogMs) {
+            return;
+        }
+        scene_heap_log_ms_ = now;
+        ESP_LOGI(TAG, "Scene heap: internal free %u, largest block %u, PSRAM free %u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    }
+
     static bool IsErrorEmotion(const char* emotion) {
         return emotion != nullptr &&
                (strcmp(emotion, "warning") == 0 || strcmp(emotion, "cancel") == 0 ||
@@ -455,7 +789,7 @@ private:
     // Under the display lock.
     void Apply() {
         jako_face_state_t state = JAKO_FACE_STATE_IDLE;
-        if (layer_ == FaceLayer::kError || radar_error_ == RadarErrorFace::kShowing) {
+        if (layer_ == FaceLayer::kError || screens_.error_face == JAKO_SCREENS_ERROR_FACE_SHOWING) {
             state = JAKO_FACE_STATE_ERROR;
         } else if (layer_ == FaceLayer::kThinking) {
             state = JAKO_FACE_STATE_THINKING;
@@ -493,10 +827,9 @@ private:
             self->layer_ = FaceLayer::kNone;
             self->Apply();
         }
-        if (self->radar_error_ == RadarErrorFace::kShowing &&
-            now - self->radar_error_since_ms_ >= kRadarErrorFaceMs) {
-            self->radar_error_ = RadarErrorFace::kOff;
-            self->Apply();
+        if (self->screens_.error_face == JAKO_SCREENS_ERROR_FACE_SHOWING &&
+            now - self->error_face_since_ms_ >= kErrorFaceMs) {
+            self->Screens(jako_screens_ev(JAKO_SCREENS_EV_ERROR_FACE_ELAPSED), "2.4 s");
         }
         float level = 0.0f;
         if (now - at <= kLevelTimeoutMs && rms > 0.0f) {
@@ -564,6 +897,12 @@ private:
     // The radar update being parsed: 856 bytes, kept here and not on the
     // main task's stack. Only the main task touches it.
     jako_radar_update_t radar_update_ = {};
+    // The dial and scene updates being parsed (624 bytes and 17,712), in
+    // PSRAM for the board's life, never on the main task's stack. Only the
+    // main task touches them; the widgets keep their own copies. nullptr
+    // when PSRAM had no room at boot: the tool then refuses with "no memory".
+    jako_dial_update_t* dial_update_ = nullptr;
+    jako_scene_update_t* scene_update_ = nullptr;
 
     void InitializePowerSaveTimer() {
         // Dim after 60 s of quiet and never power off, so the wake word keeps listening.
@@ -635,11 +974,13 @@ private:
             }
         });
 
-        // Long press (1500 ms, fired while held, never also a click): the
-        // next plane on the radar, only while it is open. Button callbacks
-        // run on the timer task, so it hops to the main task first.
+        // Long press (1500 ms, fired while held, never also a click), routed
+        // by what is in front (jako_screens.c): the next plane on the radar;
+        // nothing for the dial and a scene in slice 1; with any screen in
+        // front the dimmed screen wakes first. Button callbacks run on the
+        // timer task, so it hops to the main task first.
         boot_button_.OnLongPress([this]() {
-            Application::GetInstance().Schedule([this]() { display_->RadarNext(); });
+            Application::GetInstance().Schedule([this]() { display_->LongPress(); });
         });
     }
 
@@ -823,6 +1164,7 @@ private:
                 return true;
             });
         InitializeRadarTools(mcp_server);
+        InitializeScreenTools(mcp_server);
     }
 
     // The flight radar's two tools (docs/radar.md, wire contract v1), in
@@ -858,6 +1200,89 @@ private:
             return std::unexpected(std::string("radar: ") + jako_radar_parse_reason(parsed));
         }
         auto shown = display_->RadarUpdate(radar_update_);
+        if (!shown) {
+            return std::unexpected(shown.error());
+        }
+        return *shown;
+    }
+
+    // The dial's and the scenes' four tools (docs/screens.md, wire contract
+    // v1), in both build entries. User-only, like the radar's: never listed,
+    // the server calls them by name during a conversation. The callbacks run
+    // on the main task.
+    void InitializeScreenTools(McpServer& mcp_server) {
+        dial_update_ = static_cast<jako_dial_update_t*>(
+            heap_caps_calloc(1, sizeof(jako_dial_update_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        scene_update_ = static_cast<jako_scene_update_t*>(
+            heap_caps_calloc(1, sizeof(jako_scene_update_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (dial_update_ == nullptr || scene_update_ == nullptr) {
+            ESP_LOGE(TAG, "No PSRAM for the screen buffers (dial %s, scene %s); those tools refuse",
+                     dial_update_ != nullptr ? "ok" : "missing", scene_update_ != nullptr ? "ok" : "missing");
+        }
+        display_->SetWakeScreen([this]() { power_save_timer_->WakeUp(); });
+
+        mcp_server.AddUserOnlyTool("self.dial.update",
+            "Draw one update of the dial of today from the server. Returns the look shown, 0 for now.",
+            PropertyList({Property("data", kPropertyTypeString).SetMaxLength(JAKO_DIAL_DATA_MAX)}),
+            [this](const PropertyList& properties) -> ToolResult {
+                return DialUpdate(properties["data"].value<std::string>());
+            });
+        mcp_server.AddUserOnlyTool("self.dial.close",
+            "Take the dial off the screen until its next update. seq is this call's id.",
+            PropertyList({Property("seq", kPropertyTypeInteger, 1, 2147483647)}),
+            [this](const PropertyList& properties) -> ToolResult {
+                display_->DialClose(properties["seq"].value<int>());
+                return true;
+            });
+        mcp_server.AddUserOnlyTool("self.scene.update",
+            "Draw one of Jako's pictures from the server. Returns the id of the picture shown.",
+            PropertyList({Property("data", kPropertyTypeString).SetMaxLength(JAKO_SCENE_DATA_MAX)}),
+            [this](const PropertyList& properties) -> ToolResult {
+                return SceneUpdate(properties["data"].value<std::string>());
+            });
+        mcp_server.AddUserOnlyTool("self.scene.close",
+            "Close the picture and show the face again. seq is this call's id.",
+            PropertyList({Property("seq", kPropertyTypeInteger, 1, 2147483647)}),
+            [this](const PropertyList& properties) -> ToolResult {
+                display_->SceneClose(properties["seq"].value<int>());
+                return true;
+            });
+    }
+
+    // On the main task, as the radar's: the state check and the parse come
+    // before the display lock, so LVGL never waits on cJSON.
+    ToolResult DialUpdate(const std::string& data) {
+        const DeviceState state = Application::GetInstance().GetDeviceState();
+        if (state != kDeviceStateListening && state != kDeviceStateSpeaking) {
+            return std::unexpected(std::string("dial: not in a conversation"));
+        }
+        if (dial_update_ == nullptr) {
+            return std::unexpected(std::string("dial: no memory"));
+        }
+        const jako_dial_parse_result_t parsed = jako_dial_parse(data.data(), data.size(), dial_update_);
+        if (parsed != JAKO_DIAL_PARSE_OK) {
+            return std::unexpected(std::string("dial: ") + jako_dial_parse_reason(parsed));
+        }
+        auto shown = display_->DialUpdate(*dial_update_);
+        if (!shown) {
+            return std::unexpected(shown.error());
+        }
+        return *shown;
+    }
+
+    ToolResult SceneUpdate(const std::string& data) {
+        const DeviceState state = Application::GetInstance().GetDeviceState();
+        if (state != kDeviceStateListening && state != kDeviceStateSpeaking) {
+            return std::unexpected(std::string("scene: not in a conversation"));
+        }
+        if (scene_update_ == nullptr) {
+            return std::unexpected(std::string("scene: no memory"));
+        }
+        const jako_scene_parse_result_t parsed = jako_scene_parse(data.data(), data.size(), scene_update_);
+        if (parsed != JAKO_SCENE_PARSE_OK) {
+            return std::unexpected(std::string("scene: ") + jako_scene_parse_reason(parsed));
+        }
+        auto shown = display_->SceneUpdate(*scene_update_);
         if (!shown) {
             return std::unexpected(shown.error());
         }
